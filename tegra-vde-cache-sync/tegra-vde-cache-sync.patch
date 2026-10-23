@@ -1,0 +1,114 @@
+--- a/drivers/media/platform/nvidia/tegra-vde/v4l2.c	2026-10-23 20:41:21.838841389 +0700
++++ b/drivers/media/platform/nvidia/tegra-vde/v4l2.c	2026-10-23 20:41:58.558389498 +0700
+@@ -12,11 +12,29 @@
+  * Copyright (C) 2019 Boris Brezillon <boris.brezillon@collabora.com>
+  */
+ 
++#include <linux/dma-mapping.h>
+ #include <linux/err.h>
++#include <linux/module.h>
+ #include <linux/slab.h>
+ 
+ #include "vde.h"
+ 
++/*
++ * Opt-in for pipelines that hand decoded frames to other devices only
++ * (DMA-BUF scanout/overlay): capture planes are invalidated once, then
++ * per-frame CPU cache maintenance is skipped. CPU readers of MMAP capture
++ * buffers would see stale data, hence off by default.
++ */
++static bool skip_capture_cache_sync;
++module_param(skip_capture_cache_sync, bool, 0444);
++MODULE_PARM_DESC(skip_capture_cache_sync,
++		 "Skip per-frame cache sync of decoded frames (CPU never reads them)");
++
++static unsigned int coded_buffer_min_kb = SZ_2M / SZ_1K;
++module_param(coded_buffer_min_kb, uint, 0444);
++MODULE_PARM_DESC(coded_buffer_min_kb,
++		 "Minimum coded (bitstream) buffer size in KiB (default 2048)");
++
+ static const struct v4l2_ctrl_config ctrl_cfgs[] = {
+ 	{	.id = V4L2_CID_STATELESS_H264_DECODE_PARAMS,	},
+ 	{	.id = V4L2_CID_STATELESS_H264_SPS,		},
+@@ -214,6 +232,49 @@
+ 	__tegra_buf_cleanup(vb, vb->num_planes);
+ }
+ 
++/*
++ * vb2 would clean the whole coded buffer and invalidate every decoded
++ * plane per frame. Clean only the written bitstream bytes (payload plus
++ * the zero padding above) and, if allowed, skip decoded-frame maintenance.
++ */
++static void tegra_buf_sync_cache(struct vb2_buffer *vb)
++{
++	struct vb2_queue *vq = vb->vb2_queue;
++	struct tegra_m2m_buffer *tb = vb_to_tegra_buf(vb);
++	struct scatterlist *sg;
++	struct sg_table *sgt;
++	unsigned int i;
++	size_t len;
++
++	if (V4L2_TYPE_IS_CAPTURE(vq->type)) {
++		if (!skip_capture_cache_sync)
++			return;
++		/* No CPU reads: the post-decode invalidate is never needed. */
++		vb->skip_cache_sync_on_finish = 1;
++		/* Freshly zeroed pages may hold dirty lines; invalidate once. */
++		vb->skip_cache_sync_on_prepare = tb->cpu_cache_clean;
++		tb->cpu_cache_clean = true;
++		return;
++	}
++
++	if (vb->num_planes != 1)
++		return;
++
++	sgt = vb2_dma_sg_plane_desc(vb, 0);
++	/* buf_prepare already extended the payload to the padded HW size. */
++	len = vb->planes[0].data_offset + vb2_get_plane_payload(vb, 0);
++	for_each_sgtable_dma_sg(sgt, sg, i) {
++		size_t chunk = min_t(size_t, len, sg_dma_len(sg));
++
++		dma_sync_single_for_device(vq->dev, sg_dma_address(sg), chunk,
++					   DMA_TO_DEVICE);
++		len -= chunk;
++		if (!len)
++			break;
++	}
++	vb->skip_cache_sync_on_prepare = 1;
++}
++
+ static int tegra_buf_prepare(struct vb2_buffer *vb)
+ {
+ 	struct vb2_queue *vq = vb->vb2_queue;
+@@ -269,6 +330,9 @@
+ 		tb->dma_addr[i] = tb->dma_base[i] + offset;
+ 	}
+ 
++	if (vq->memory == VB2_MEMORY_MMAP && ctx->vde->domain)
++		tegra_buf_sync_cache(vb);
++
+ 	switch (pixfmt->pixelformat) {
+ 	case V4L2_PIX_FMT_YVU420M:
+ 		swap(tb->dma_addr[1], tb->dma_addr[2]);
+@@ -646,7 +710,9 @@
+ 				       &pix_mp->height,
+ 				       &desc->frmsize);
+ 
+-	pix_mp->plane_fmt[0].sizeimage = max(ALIGN(size, SXE_BUFFER), SZ_2M);
++	pix_mp->plane_fmt[0].sizeimage = max_t(unsigned int, ALIGN(size, SXE_BUFFER),
++					       ALIGN(coded_buffer_min_kb * SZ_1K,
++						     SXE_BUFFER));
+ 	pix_mp->field = V4L2_FIELD_NONE;
+ 	pix_mp->num_planes = 1;
+ 
+--- a/drivers/media/platform/nvidia/tegra-vde/vde.h	2026-10-23 20:41:21.838793182 +0700
++++ b/drivers/media/platform/nvidia/tegra-vde/vde.h	2026-10-23 20:41:25.104511504 +0700
+@@ -161,6 +161,8 @@
+ 	struct iova *iova[VB2_MAX_PLANES];
+ 	struct tegra_vde_bo *aux;
+ 	bool b_frame;
++	/* Capture planes were invalidated once; the CPU never touches them after. */
++	bool cpu_cache_clean;
+ };
+ 
+ static inline struct tegra_m2m_buffer *

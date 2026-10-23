@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+
+description="Surface appliance GStreamer registry warmup"
+
+depend() {
+    need surface-xorg
+    after surface-xorg
+}
+
+start() {
+    ebegin "Warming GStreamer registry as user"
+    local i=0
+    while [ "$i" -lt 50 ]; do
+        if [ -S /tmp/.X11-unix/X0 ]; then
+            break
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+
+    su -s /bin/sh user -c "DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/10000 gst-inspect-1.0 >/dev/null 2>&1" || true
+    su -s /bin/sh user -c "DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/10000 python3 -c 'import gi; gi.require_version(\"Gst\", \"1.0\"); from gi.repository import Gst; Gst.init(None)' >/dev/null 2>&1" || true
+    eend 0
+}

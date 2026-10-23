@@ -1,0 +1,121 @@
+#!/usr/bin/python3
+"""Idle screen for the Surface appliance.
+
+Shows the network state while no receiver window is mapped, and lets DPMS turn the
+panel off after BLANK_S seconds without input. The receiver disables DPMS itself
+before it touches the display; this client re-arms it once the receiver's window is gone.
+"""
+import ctypes as C
+import os
+import select
+import subprocess
+
+BLANK_S = 60
+IFACE = 'eth0'
+PC = '10.42.0.1'
+
+EXPOSE, DESTROY_NOTIFY, UNMAP_NOTIFY, MAP_NOTIFY = 12, 17, 18, 19
+EXPOSURE_MASK, SUBSTRUCTURE_NOTIFY_MASK = 1 << 15, 1 << 19
+
+
+class AnyEvent(C.Structure):
+    _fields_ = [('type', C.c_int), ('serial', C.c_ulong), ('send_event', C.c_int),
+                ('display', C.c_void_p), ('event', C.c_ulong), ('window', C.c_ulong)]
+
+
+class Event(C.Union):
+    _fields_ = [('type', C.c_int), ('any', AnyEvent), ('pad', C.c_long * 24)]
+
+
+class FontHead(C.Structure):
+    _fields_ = [('ext_data', C.c_void_p), ('fid', C.c_ulong)]
+
+
+def status():
+    net = f'/sys/class/net/{IFACE}'
+    if not os.path.isdir(net):
+        return 'No network adapter. Plug the USB ethernet adapter into the Surface.'
+    try:
+        with open(f'{net}/carrier') as f:
+            carrier = f.read().strip()
+    except OSError:
+        carrier = '0'
+    if carrier != '1':
+        return 'No network link. Connect the ethernet cable to the PC.'
+    return f'Waiting for the PC ({PC}) to connect.'
+
+
+def xset(*args):
+    subprocess.run(['xset', *args], check=False)
+
+
+def main():
+    x = C.CDLL('libX11.so.6')
+    p, u = C.c_void_p, C.c_ulong
+    for name, args, res in (
+            ('XOpenDisplay', [C.c_char_p], p), ('XDefaultScreen', [p], C.c_int),
+            ('XRootWindow', [p, C.c_int], u), ('XDisplayWidth', [p, C.c_int], C.c_int),
+            ('XDisplayHeight', [p, C.c_int], C.c_int), ('XWhitePixel', [p, C.c_int], u),
+            ('XBlackPixel', [p, C.c_int], u),
+            ('XCreateSimpleWindow', [p, u, C.c_int, C.c_int, C.c_uint, C.c_uint, C.c_uint, u, u], u),
+            ('XSelectInput', [p, u, C.c_long], C.c_int), ('XCreateGC', [p, u, u, p], p),
+            ('XSetForeground', [p, p, u], C.c_int), ('XLoadQueryFont', [p, C.c_char_p], p),
+            ('XSetFont', [p, p, u], C.c_int), ('XTextWidth', [p, C.c_char_p, C.c_int], C.c_int),
+            ('XMapWindow', [p, u], C.c_int), ('XClearWindow', [p, u], C.c_int),
+            ('XDrawString', [p, u, p, C.c_int, C.c_int, C.c_char_p, C.c_int], C.c_int),
+            ('XFlush', [p], C.c_int), ('XPending', [p], C.c_int),
+            ('XNextEvent', [p, C.POINTER(Event)], C.c_int), ('XConnectionNumber', [p], C.c_int)):
+        fn = getattr(x, name)
+        fn.argtypes, fn.restype = args, res
+
+    d = x.XOpenDisplay(None)
+    if not d:
+        raise SystemExit('surface-idle: cannot open display')
+    scr = x.XDefaultScreen(d)
+    root = x.XRootWindow(d, scr)
+    width, height = x.XDisplayWidth(d, scr), x.XDisplayHeight(d, scr)
+    black = x.XBlackPixel(d, scr)
+    win = x.XCreateSimpleWindow(d, root, 0, 0, width, height, 0, black, black)
+    x.XSelectInput(d, win, EXPOSURE_MASK)
+    x.XSelectInput(d, root, SUBSTRUCTURE_NOTIFY_MASK)
+    gc = x.XCreateGC(d, win, 0, None)
+    x.XSetForeground(d, gc, x.XWhitePixel(d, scr))
+    font = next(f for f in (x.XLoadQueryFont(d, n) for n in (b'10x20', b'9x15', b'fixed')) if f)
+    x.XSetFont(d, gc, FontHead.from_address(font).fid)
+    x.XMapWindow(d, win)
+
+    def draw(lines):
+        x.XClearWindow(d, win)
+        for i, line in enumerate(lines):
+            text = line.encode()
+            x.XDrawString(d, win, gc, (width - x.XTextWidth(font, text, len(text))) // 2,
+                          height // 2 + 30 * i, text, len(text))
+        x.XFlush(d)
+
+    xset('dpms', '0', '0', str(BLANK_S), 's', 'reset')
+    receivers = set()
+    shown = None
+    event = Event()
+    fd = x.XConnectionNumber(d)
+    while True:
+        while x.XPending(d):
+            x.XNextEvent(d, C.byref(event))
+            if event.type == EXPOSE:
+                shown = None
+            elif event.any.window == win:
+                continue
+            elif event.type == MAP_NOTIFY:
+                receivers.add(event.any.window)
+            elif event.type in (UNMAP_NOTIFY, DESTROY_NOTIFY) and event.any.window in receivers:
+                receivers.discard(event.any.window)
+                if not receivers:
+                    xset('dpms', '0', '0', str(BLANK_S), 's', 'reset')
+        text = status()
+        if text != shown:
+            draw(['Surface RT display', text])
+            shown = text
+        select.select([fd], [], [], 1.0)
+
+
+if __name__ == '__main__':
+    main()

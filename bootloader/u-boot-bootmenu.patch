@@ -1,0 +1,13 @@
+diff --git a/board/microsoft/surface-rt/surface-rt.env b/board/microsoft/surface-rt/surface-rt.env
+index 68292909..0a615040 100644
+--- a/board/microsoft/surface-rt/surface-rt.env
++++ b/board/microsoft/surface-rt/surface-rt.env
+@@ -7,7 +7,7 @@ partitions=name=emmc,start=0,size=-,uuid=${uuid_gpt_rootfs}
+ bootmenu_0=mount internal storage=usb start && ums 0 mmc 0; bootmenu
+ bootmenu_1=mount external storage=usb start && ums 0 mmc 1; bootmenu
+ bootmenu_2=fastboot=echo Starting Fastboot protocol ...; fastboot usb 0; bootmenu
+-bootmenu_3=boot from USB=usb reset; usb start; bootflow scan
++bootmenu_3=boot Linux from internal storage=bootflow scan mmc0; bootmenu
+ bootmenu_4=reboot RCM=enterrcm
+ bootmenu_5=reboot=reset
+ bootmenu_6=power off=poweroff

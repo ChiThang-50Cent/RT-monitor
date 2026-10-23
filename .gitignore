@@ -1,0 +1,11 @@
+# Nura (postmarketOS fallback) images, boot files and device backups, kept for restore
+/nura/
+
+# Upstream trees and host build deps used in place
+/u-boot/
+/tegra30_debrick/
+/build-deps/
+/.venv/
+
+/lab/clip.frames
+__pycache__/

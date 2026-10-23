@@ -1,0 +1,43 @@
+#!/bin/sh
+# Usage: surface-boot-select nura | <release-id> | --list
+# Sets DEFAULT in p1:/extlinux/extlinux.conf. Only the DEFAULT line changes.
+set -eu
+BOOT_UUID=17C0-8631
+
+die() { echo "surface-boot-select: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || die "must run as root"
+[ $# = 1 ] || die "usage: surface-boot-select nura|<release-id>|--list"
+
+dev=$(readlink -f "/dev/disk/by-uuid/$BOOT_UUID" 2>/dev/null || true)
+[ -b "$dev" ] || dev=$(blkid -U "$BOOT_UUID" 2>/dev/null || blkid | sed -n "s/^\([^:]*\):.*UUID=\"$BOOT_UUID\".*/\1/p")
+[ -n "$dev" ] || die "boot partition $BOOT_UUID not found"
+mnt=$(awk -v d="$dev" '$1 == d { print $2; exit }' /proc/mounts)
+[ -n "$mnt" ] || die "$dev is not mounted"
+conf=$mnt/extlinux/extlinux.conf
+[ -f "$conf" ] || die "$conf missing"
+
+case $1 in
+--list) grep -E '^(DEFAULT|LABEL) ' "$conf"; exit 0 ;;
+nura) label=surface-rt ;;
+*) label=appliance-$1 ;;
+esac
+grep -qx "LABEL $label" "$conf" || die "no LABEL $label in $conf"
+if grep -qx "DEFAULT $label" "$conf"; then
+	echo "DEFAULT already $label"
+	exit 0
+fi
+
+ro=0
+if awk -v m="$mnt" '$2 == m { split($4, o, ","); exit o[1] == "ro" ? 0 : 1 }' /proc/mounts; then
+	ro=1
+	mount -o remount,rw "$mnt"
+fi
+restore() { [ $ro = 0 ] || mount -o remount,ro "$mnt"; }
+trap restore EXIT
+
+sed "s/^DEFAULT .*/DEFAULT $label/" "$conf" > "$conf.new"
+grep -qx "DEFAULT $label" "$conf.new" || die "rewrite failed"
+sync "$conf.new"
+mv "$conf.new" "$conf"
+sync
+echo "DEFAULT $label"

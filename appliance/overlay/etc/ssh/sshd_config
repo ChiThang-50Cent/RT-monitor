@@ -1,0 +1,18 @@
+# Surface RT display appliance sshd_config
+Port 22
+Protocol 2
+
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+PermitRootLogin no
+AllowUsers user
+
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp /usr/lib/ssh/sftp-server

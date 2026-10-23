@@ -1,0 +1,3 @@
+# Disable automatic host key generation in sshd init script
+sshd_disable_keygen="yes"
+rc_need="surface-identity"

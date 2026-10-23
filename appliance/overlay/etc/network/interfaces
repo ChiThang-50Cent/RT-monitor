@@ -1,0 +1,7 @@
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+    address 10.42.0.2/24
+    gateway 10.42.0.1

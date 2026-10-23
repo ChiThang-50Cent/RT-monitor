@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+
+description="Surface appliance OpenTegra Xorg server"
+supervisor="supervise-daemon"
+
+depend() {
+    need surface-runtime udev
+    before surface-warmup
+}
+
+command="/usr/bin/Xorg"
+command_args=":0 -seat seat0 -auth /home/user/.Xauthority -nolisten tcp -noreset -s 0 vt7 -novtswitch"
+pidfile="/run/surface-xorg.pid"
+respawn_delay=1
+respawn_max=0

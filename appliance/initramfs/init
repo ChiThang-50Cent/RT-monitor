@@ -1,0 +1,126 @@
+#!/bin/sh
+# Surface RT display appliance initramfs
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+rescue_shell() {
+    echo "====================================================" >&2
+    echo "Surface Appliance Boot Failure: $1" >&2
+    echo "Dropping to rescue shell. Never writing to eMMC." >&2
+    echo "====================================================" >&2
+    while true; do
+        /bin/sh -i </dev/console >/dev/console 2>&1 || /bin/sh
+    done
+}
+
+mount -t proc -o noexec,nosuid,nodev proc /proc || rescue_shell "mount /proc failed"
+mount -t sysfs -o noexec,nosuid,nodev sysfs /sys || rescue_shell "mount /sys failed"
+mount -t devtmpfs -o nosuid,noexec devtmpfs /dev || rescue_shell "mount /dev failed"
+
+# Load storage / filesystem modules (squashfs, overlay)
+for mod in squashfs overlay; do
+    modprobe "$mod" 2>/dev/null || true
+done
+for ko in /lib/modules/*/*/*/*.ko* /lib/modules/*/*/*/*/*.ko*; do
+    [ -f "$ko" ] && insmod "$ko" 2>/dev/null || true
+done
+
+BOOT_UUID="17C0-8631"
+BOOT_DEV=""
+TIMEOUT=15
+
+echo "Waiting up to ${TIMEOUT}s for partition UUID=$BOOT_UUID..."
+i=0
+while [ "$i" -lt "$TIMEOUT" ]; do
+    BOOT_DEV=$(blkid -U "$BOOT_UUID" 2>/dev/null || true)
+    if [ -z "$BOOT_DEV" ]; then
+        BOOT_DEV=$(findfs UUID="$BOOT_UUID" 2>/dev/null || true)
+    fi
+    if [ -z "$BOOT_DEV" ] && [ -b "/dev/disk/by-uuid/$BOOT_UUID" ]; then
+        BOOT_DEV="/dev/disk/by-uuid/$BOOT_UUID"
+    fi
+    if [ -n "$BOOT_DEV" ] && [ -b "$BOOT_DEV" ]; then
+        break
+    fi
+    sleep 1
+    i=$((i + 1))
+done
+
+if [ -z "$BOOT_DEV" ] || [ ! -b "$BOOT_DEV" ]; then
+    rescue_shell "Timeout waiting for boot partition UUID=$BOOT_UUID"
+fi
+
+echo "Mounting boot partition $BOOT_DEV at /media/boot (read-only)..."
+mkdir -p /media/boot
+if ! mount -t vfat -o ro,noatime,fmask=0077,dmask=0077 "$BOOT_DEV" /media/boot; then
+    rescue_shell "Failed to mount boot partition $BOOT_DEV read-only"
+fi
+
+RELEASE_ID=""
+for opt in $(cat /proc/cmdline); do
+    case "$opt" in
+        appliance.release=*)
+            RELEASE_ID="${opt#appliance.release=}"
+            ;;
+    esac
+done
+
+if [ -z "$RELEASE_ID" ]; then
+    rescue_shell "Missing appliance.release=<id> parameter in /proc/cmdline"
+fi
+
+RELEASE_DIR="/media/boot/appliance/$RELEASE_ID"
+if [ ! -d "$RELEASE_DIR" ]; then
+    rescue_shell "Appliance release directory $RELEASE_DIR not found"
+fi
+
+SHA_FILE="$RELEASE_DIR/SHA256SUMS"
+SQUASHFS_FILE="$RELEASE_DIR/rootfs.squashfs"
+
+if [ ! -f "$SHA_FILE" ]; then
+    rescue_shell "SHA256SUMS file missing at $SHA_FILE"
+fi
+if [ ! -f "$SQUASHFS_FILE" ]; then
+    rescue_shell "rootfs.squashfs missing at $SQUASHFS_FILE"
+fi
+
+echo "Verifying SHA256 checksum for rootfs.squashfs..."
+EXPECTED_SHA=$(grep -E '(^|[[:space:]])rootfs\.squashfs$' "$SHA_FILE" | awk '{print $1}')
+if [ -z "$EXPECTED_SHA" ]; then
+    rescue_shell "No SHA256 entry for rootfs.squashfs found in $SHA_FILE"
+fi
+
+ACTUAL_SHA=$(sha256sum "$SQUASHFS_FILE" | awk '{print $1}')
+if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+    rescue_shell "SHA256 checksum mismatch for rootfs.squashfs: expected $EXPECTED_SHA, got $ACTUAL_SHA"
+fi
+echo "Checksum verified: $ACTUAL_SHA"
+
+mkdir -p /ro_squash /overlay_tmpfs /sysroot
+
+echo "Loop-mounting rootfs.squashfs..."
+if ! mount -t squashfs -o ro,loop "$SQUASHFS_FILE" /ro_squash; then
+    rescue_shell "Failed to loop-mount $SQUASHFS_FILE"
+fi
+
+echo "Setting up tmpfs overlay..."
+if ! mount -t tmpfs -o mode=0755 tmpfs /overlay_tmpfs; then
+    rescue_shell "Failed to mount tmpfs for overlay"
+fi
+
+mkdir -p /overlay_tmpfs/upper /overlay_tmpfs/work
+
+if ! mount -t overlay overlay -o lowerdir=/ro_squash,upperdir=/overlay_tmpfs/upper,workdir=/overlay_tmpfs/work /sysroot; then
+    rescue_shell "Failed to mount overlay on /sysroot"
+fi
+
+mkdir -p /sysroot/media/boot
+if ! mount --move /media/boot /sysroot/media/boot; then
+    rescue_shell "Failed to move /media/boot into /sysroot/media/boot"
+fi
+
+umount /dev
+umount /sys
+umount /proc
+
+echo "Switching to appliance /sbin/init..."
+exec switch_root /sysroot /sbin/init

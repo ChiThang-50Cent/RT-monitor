@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+
+description="Surface appliance idle screen"
+supervisor="supervise-daemon"
+
+depend() {
+    need surface-xorg
+    after surface-xorg
+}
+
+command="/usr/bin/python3"
+command_args="/usr/libexec/surface-idle"
+command_user="user"
+supervise_daemon_args="--env DISPLAY=:0 --env XAUTHORITY=/home/user/.Xauthority --env HOME=/home/user"
+pidfile="/run/surface-idle.pid"
+respawn_delay=2
+respawn_max=0

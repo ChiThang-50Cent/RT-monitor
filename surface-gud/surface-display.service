@@ -1,0 +1,14 @@
+[Unit]
+Description=Surface RT extended desktop over direct LAN
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/code/sureface/surface-gud/display_sender.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=graphical-session.target

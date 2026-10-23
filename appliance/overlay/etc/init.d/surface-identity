@@ -1,0 +1,53 @@
+#!/sbin/openrc-run
+
+description="Surface appliance SSH identity loader"
+
+depend() {
+    need localmount
+    before sshd
+}
+
+start() {
+    local id_dir="/media/boot/appliance/identity"
+    local count=0
+
+    ebegin "Loading SSH host keys and authorized_keys from $id_dir"
+
+    if [ ! -d "$id_dir" ]; then
+        eerror "Identity directory $id_dir missing"
+        eend 1
+        return 1
+    fi
+
+    for k in "$id_dir"/ssh_host_*_key; do
+        if [ -f "$k" ]; then
+            count=$((count + 1))
+            cp -f "$k" /etc/ssh/
+            chmod 600 "/etc/ssh/$(basename "$k")"
+            chown root:root "/etc/ssh/$(basename "$k")"
+            if [ -f "${k}.pub" ]; then
+                cp -f "${k}.pub" /etc/ssh/
+                chmod 644 "/etc/ssh/$(basename "${k}.pub")"
+                chown root:root "/etc/ssh/$(basename "${k}.pub")"
+            fi
+        fi
+    done
+
+    if [ "$count" -eq 0 ]; then
+        eerror "No ssh_host_*_key found in $id_dir"
+        eend 1
+        return 1
+    fi
+
+    if [ -f "$id_dir/authorized_keys" ]; then
+        mkdir -p /home/user/.ssh
+        cp -f "$id_dir/authorized_keys" /home/user/.ssh/authorized_keys
+        chmod 700 /home/user/.ssh
+        chmod 600 /home/user/.ssh/authorized_keys
+        chown -R 10000:10000 /home/user/.ssh
+    else
+        ewarn "No authorized_keys found in $id_dir"
+    fi
+
+    eend 0
+}

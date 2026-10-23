@@ -1,0 +1,4 @@
+127.0.0.1   localhost surface-rt
+::1         localhost ip6-localhost ip6-loopback
+10.42.0.1   pc
+10.42.0.2   surface-rt

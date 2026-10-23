@@ -1,0 +1,37 @@
+#!/sbin/openrc-run
+
+description="Surface appliance runtime directory and X authority initialization"
+
+depend() {
+    need localmount
+    before surface-xorg sshd
+}
+
+start() {
+    ebegin "Initializing Surface runtime environment"
+
+    mkdir -p /run/user/10000
+    chmod 700 /run/user/10000
+    chown 10000:10000 /run/user/10000
+
+    touch /run/user/10000/surface-appliance-active
+    chmod 644 /run/user/10000/surface-appliance-active
+    chown 10000:10000 /run/user/10000/surface-appliance-active
+
+    local cookie
+    cookie=$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -e '16/1 "%02x"')
+    if [ -z "$cookie" ]; then
+        cookie=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    fi
+
+    rm -f /home/user/.Xauthority
+    touch /home/user/.Xauthority
+    chmod 600 /home/user/.Xauthority
+    chown 10000:10000 /home/user/.Xauthority
+
+    xauth -f /home/user/.Xauthority add :0 . "$cookie"
+    chown 10000:10000 /home/user/.Xauthority
+    chmod 600 /home/user/.Xauthority
+
+    eend 0
+}
