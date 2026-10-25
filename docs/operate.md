@@ -174,10 +174,13 @@ physical pointer check before recovery. The recovery timer includes this hold.
 
 The runner interrupts the display, loads receiver code in RAM through pinned
 SSH, injects pointer motion, and tests leave, reentry, and channel reconnection.
-It restores the committed sender through a temporary PC service override. Logs
-and recovery sources stay under `/tmp/surface-latency-results/<time>-cursor/`.
-The test checks software presentation and does not photograph the panel.
-The restored process runs the committed sender until the next service restart.
+It restores the baseline sender through a temporary PC service override. When
+the running sender is already a recovery copy, that copy is preserved. Otherwise
+the baseline comes from committed host sources. Logs and recovery sources stay
+under `/tmp/surface-latency-results/<time>-cursor/`. The test checks software
+presentation and does not photograph the panel. The restored process runs the
+baseline sender until the next service restart. Before testing a committed host
+update, make sure the baseline sources match the installed receiver.
 It does not install the cursor receiver or change the boot release.
 
 ## Measure decoder and presentation performance

@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Exercise current cursor sources in RAM and restore the committed sender."""
+"""Exercise current cursor sources in RAM and restore the baseline sender."""
 import argparse
 import json
 import os
@@ -142,15 +142,20 @@ def main():
     pid = int(subprocess.check_output(service + ['show', 'surface-display.service', '-p', 'MainPID', '--value']))
     if not pid:
         raise RuntimeError('surface-display.service must be running before the smoke run')
-    baseline = {
-        name: subprocess.check_output(['git', 'show', 'HEAD:surface-gud/' + name], cwd=ROOT)
-        for name in ('display_sender.py', 'surface_protocol.py')
-    }
-    capture_path = 'HEAD:surface-gud/surface_cursor_capture.py'
-    if subprocess.run(['git', 'cat-file', '-e', capture_path], cwd=ROOT,
-                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-        baseline['surface_cursor_capture.py'] = subprocess.check_output(
-            ['git', 'show', capture_path], cwd=ROOT)
+    command_line = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+    running = next(Path(os.fsdecode(arg)).resolve() for arg in command_line
+                   if arg.endswith(b'/display_sender.py'))
+    names = ('display_sender.py', 'surface_protocol.py', 'surface_cursor_capture.py')
+    if running.parent != ROOT / 'surface-gud':
+        baseline = {name: (running.parent / name).read_bytes() for name in names
+                    if (running.parent / name).is_file()}
+    else:
+        baseline = {}
+        for name in names:
+            source = 'HEAD:surface-gud/' + name
+            if subprocess.run(['git', 'cat-file', '-e', source], cwd=ROOT,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                baseline[name] = subprocess.check_output(['git', 'show', source], cwd=ROOT)
     out = Path('/tmp/surface-latency-results') / (time.strftime('%Y%m%d-%H%M%S') + '-cursor')
     out.mkdir(parents=True)
     ready = threading.Event()
