@@ -9,3 +9,6 @@
 
 /lab/clip.frames
 __pycache__/
+
+# Agents
+AGENTS.md
