@@ -25,7 +25,6 @@ import argparse
 import math
 import os
 from pathlib import Path
-import shutil
 import signal
 import struct
 import subprocess
@@ -35,7 +34,6 @@ import wave
 
 DEFAULT_TARGET = "user@10.42.0.2"
 DEFAULT_SURFACE_IP = "10.42.0.2"
-DEFAULT_PC_IP = "10.42.0.1"
 DEFAULT_PORT = 24727  # Repurposes pre-existing open firewall port (ausweisapp2 exception)
 DEFAULT_SINK_NAME = "surface_rt_speakers"
 DEFAULT_DESCRIPTION = "Surface RT Speakers"
