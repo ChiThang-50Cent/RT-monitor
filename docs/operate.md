@@ -10,7 +10,11 @@ SURFACE="-i $HOME/.ssh/surface_omp -o UserKnownHostsFile=$PWD/surface-known-host
 
 ## Power on the Surface
 
-The U-Boot that starts Linux lives in RAM, so you repeat these steps after every power-off and every reboot.
+For an internal EFI installation that has passed the cold-boot checks in [Install internal EFI](install.md#install-internal-efi), press and release **Power**. Leave the ethernet adapter connected. No APX cable, boot USB, Volume button, or menu selection should be needed.
+
+Internal EFI installation is a candidate until that physical check succeeds. Building a bundle does not install it or prove that the firmware selects it.
+
+The preserved base release and the APX recovery path still use RAM U-Boot:
 
 1. Hold **Power** and **Volume Up** until the Surface enters APX mode.
 2. Connect the Surface's USB port to the PC with the A-to-A cable.
@@ -22,10 +26,10 @@ The U-Boot that starts Linux lives in RAM, so you repeat these steps after every
 
 	The script prints `U-Boot started`.
 
-4. In the boot menu, select **boot Linux from internal storage**. The menu waits until you choose. Use the volume buttons to move and the power button to select.
+4. In the boot menu, select **boot Linux from internal storage**. Use the volume buttons to move and the power button to select.
 5. Unplug the A-to-A cable and plug in the USB ethernet adapter.
 
-The PC service `surface-display.service` connects on its own once the network is up.
+The PC service `surface-display.service` connects once the network is up.
 
 ## Read the idle screen
 
@@ -37,15 +41,27 @@ When no PC is connected, the appliance shows **Surface RT display** and one stat
 | `No network link. Connect the ethernet cable to the PC.` | The adapter is present but has no link. |
 | `Waiting for the PC (10.42.0.1) to connect.` | The link is up and the sender has not connected yet. |
 
-After 60 seconds without input, the panel and its backlight turn off. When the sender connects, the receiver turns the panel on and covers the idle screen. When the sender disconnects, the idle screen returns and the 60-second timer restarts.
+The idle panel blanks after 60 seconds. An admitted receiver wakes automatic idle blanking. A screen that you turned off with a short Power press stays off across frames and receiver reconnects.
 
-## Power off the appliance
+## Control the screen and shut down
 
-Hold **Power** for about 10 seconds. A hard power-off is safe on the appliance. The appliance mounts the boot partition read-only, never mounts the Nura partition, and keeps all its changes in RAM.
+These controls require the new confirmed-power-control release. The preserved base release `6258b2a5368a` does not implement them.
 
-Do not hold **Power** to shut down Nura. Nura writes to its ext4 partition. Shut it down with `sudo poweroff`.
+- Press and release **Power** before 3 seconds to toggle the backlight. Linux and the network stay running. This is not suspend.
+- Hold **Power** for about 3 seconds to request shutdown. Release it when the confirmation appears. The original release does not cancel.
+- The visible confirmation counts down for 30 seconds. Press **Power** again to cancel. The cancellation press and its release do not toggle the screen or start another hold.
+- If you leave the confirmation alone, the appliance requests a clean shutdown when the countdown expires.
+- After cancellation, the previous manual screen-off choice returns. The video sender reconnects because confirmation deliberately closes the video session to release its hardware overlay.
+
+The countdown starts only after the controller establishes its rendering checks. If input, backlight, or presentation ownership fails, the appliance must not shut down behind an invisible warning.
+
+Do not keep holding Power throughout the countdown. A hardware forced power cut can bypass software confirmation. The hardware hold duration has not been measured.
+
+Do not use a forced power cut to shut down Nura. Nura writes to its ext4 partition. Shut it down with `sudo poweroff`.
 
 ## Switch to Nura
+
+`surface-boot-select` changes the RAM U-Boot `extlinux` default. It does not change the internal EFI startup script.
 
 1. While the appliance runs, make Nura the default boot entry:
 
@@ -55,9 +71,11 @@ Do not hold **Power** to shut down Nura. Nura writes to its ext4 partition. Shut
 
 	The command prints `DEFAULT surface-rt`.
 
-2. Power off the appliance, then [power on the Surface](#power-on-the-surface). Nura starts.
+2. Power off the appliance, then use the **APX and RAM U-Boot recovery path** under [Power on the Surface](#power-on-the-surface). Select **boot Linux from internal storage**. Nura starts. To undo the internal EFI installation itself, restore its backup as described in [Install internal EFI](install.md#install-internal-efi).
 
 ## Switch from Nura to the appliance
+
+This procedure selects a full release already listed in extlinux. An internal EFI extension ID is not an extlinux label. To install that release, follow [Install internal EFI](install.md#install-internal-efi) instead.
 
 1. Shut down Nura with `sudo poweroff`.
 2. Enter APX mode, connect the A-to-A cable, and run `appliance/load-uboot.sh`.
@@ -73,6 +91,8 @@ Do not hold **Power** to shut down Nura. Nura writes to its ext4 partition. Shut
 ## Recover when the appliance does not boot
 
 `recovery-pc.sh restore` puts back the original Nura `extlinux.conf` that the first install saved. It touches only the boot partition and needs no `sudo`.
+
+This command does not restore overwritten EFI files. Use the internal EFI installer's verified backup to undo that installation.
 
 1. Enter APX mode, connect the A-to-A cable, and run `appliance/load-uboot.sh`.
 2. In the boot menu, select **mount internal storage**.
@@ -91,6 +111,10 @@ The restored file has no appliance entries. The release files stay in `/boot/app
 
 ## Update the appliance
 
+For an internal EFI extension release, use [Install internal EFI](install.md#install-internal-efi) to build and install another verified bundle. Preserve `6258b2a5368a`; extension releases depend on that frozen base.
+
+The following procedure builds a full release for the RAM U-Boot path:
+
 1. Change the code. Files under `appliance/overlay/` change only the root filesystem. `surface-kernel.config` and the kernel patch change the kernel.
 2. Build a new release. The command prints the new `<id>`:
 
@@ -107,7 +131,7 @@ The restored file has no appliance entries. The release files stay in `/boot/app
 	appliance/verify-boot.sh <id>
 	```
 
-`surface-gud/display_receiver.py`, `surface-gud/surface_xv.py`, and `surface-gud/surface_protocol.py` have copies in `appliance/overlay/home/user/`. Copy your changes into the overlay before you build.
+`surface-gud/display_receiver.py`, `surface-gud/surface_xv.py`, `surface-gud/surface_protocol.py`, and `surface-gud/surface_power.py` have copies in `appliance/overlay/home/user/`. Update both copies before you build.
 
 Old releases stay on the boot partition. To delete one, run this on Nura:
 
@@ -115,7 +139,7 @@ Old releases stay on the boot partition. To delete one, run this on Nura:
 sudo rm -r /boot/appliance/<old-id>
 ```
 
-Delete only releases that are not the current default and not listed in `/boot/extlinux/extlinux.conf`.
+Delete only releases that are not the current default, not listed in `/boot/extlinux/extlinux.conf`, and not required as a base by an installed extension. In particular, keep `6258b2a5368a`.
 
 ## Check the stream
 

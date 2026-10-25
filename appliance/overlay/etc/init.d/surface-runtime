@@ -18,6 +18,12 @@ start() {
     chmod 644 /run/user/10000/surface-appliance-active
     chown 10000:10000 /run/user/10000/surface-appliance-active
 
+    local panel=/sys/class/backlight/backlight
+    if [ -e "$panel/brightness" ] && [ "$(basename "$(readlink -f "$panel/device/driver")")" = pwm-backlight ]; then
+        chgrp video "$panel/brightness"
+        chmod g+w "$panel/brightness"
+    fi
+
     local cookie
     cookie=$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | hexdump -e '16/1 "%02x"')
     if [ -z "$cookie" ]; then

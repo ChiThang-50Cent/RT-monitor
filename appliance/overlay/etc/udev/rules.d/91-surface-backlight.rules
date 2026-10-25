@@ -1,0 +1,1 @@
+ACTION=="add", SUBSYSTEM=="backlight", KERNEL=="backlight", DRIVERS=="pwm-backlight", RUN+="/bin/chgrp video /sys%p/brightness", RUN+="/bin/chmod g+w /sys%p/brightness"

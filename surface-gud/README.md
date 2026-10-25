@@ -82,7 +82,7 @@ The deployed setup uses `user@10.42.0.2`, X11 `:0`, UID 10000, SSH key
 # Deploy receiver with the same pinned SSH options used for the connection.
 scp -i ~/.ssh/surface_omp -o UserKnownHostsFile=surface-known-hosts \
   -o StrictHostKeyChecking=yes surface-gud/display_receiver.py \
-  surface-gud/surface_xv.py surface-gud/surface_protocol.py \
+  surface-gud/surface_xv.py surface-gud/surface_protocol.py surface-gud/surface_power.py \
   user@10.42.0.2:/home/user/
 
 # Foreground mode (do not run alongside the service).
@@ -103,9 +103,13 @@ journalctl --user -u surface-display.service
 The Surface must already be running the appliance OS (`appliance/`) or the
 Nura XFCE session, with its SSH server up. Stopping
 the host service removes its virtual monitor; a host service restart recreates
-it, unlike a receiver-only reconnect. Independent Surface cold boot is **not
-installed**: loss of the RAM-loaded U-Boot still requires APX recovery from the
-PC (`appliance/load-uboot.sh`).
+it, unlike a receiver-only reconnect. Internal EFI installation and its physical
+cold-boot checks are documented in [Install internal EFI](../docs/install.md#install-internal-efi).
+Until those checks pass, keep the proven rescue USB and APX recovery assets.
+
+The appliance receiver requires the matching `surface-idle` presentation controller.
+Do not copy a new receiver alone onto the preserved base appliance. Install its
+complete extension release. Nura desktop operation does not acquire that lease.
 
 Logs report 100-frame batches: acknowledged throughput, compressed payload
 bandwidth, fresh-capture-timestamp-to-ACK upper bounds, wire-to-ACK duration,

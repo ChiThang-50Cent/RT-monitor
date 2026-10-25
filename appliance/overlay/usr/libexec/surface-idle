@@ -1,121 +1,887 @@
 #!/usr/bin/python3
-"""Idle screen for the Surface appliance.
-
-Shows the network state while no receiver window is mapped, and lets DPMS turn the
-panel off after BLANK_S seconds without input. The receiver disables DPMS itself
-before it touches the display; this client re-arms it once the receiver's window is gone.
-"""
 import ctypes as C
+from dataclasses import dataclass, replace
+from enum import Enum
+import fcntl
+import math
 import os
+from pathlib import Path
 import select
+import socket
+import stat
+import struct
 import subprocess
+import sys
+import time
 
 BLANK_S = 60
-IFACE = 'eth0'
-PC = '10.42.0.1'
-
-EXPOSE, DESTROY_NOTIFY, UNMAP_NOTIFY, MAP_NOTIFY = 12, 17, 18, 19
-EXPOSURE_MASK, SUBSTRUCTURE_NOTIFY_MASK = 1 << 15, 1 << 19
-
-
-class AnyEvent(C.Structure):
-    _fields_ = [('type', C.c_int), ('serial', C.c_ulong), ('send_event', C.c_int),
-                ('display', C.c_void_p), ('event', C.c_ulong), ('window', C.c_ulong)]
+HOLD_S = 3.0
+COUNTDOWN_S = 30.0
+PREPARE_S = 5.0
+SOCKET_PATH = '/run/user/10000/surface-power.sock'
+INPUT_EVENT = struct.Struct('llHHi')
+KEY_POWER = 116
 
 
-class Event(C.Union):
-    _fields_ = [('type', C.c_int), ('any', AnyEvent), ('pad', C.c_long * 24)]
+class ScreenIntent(Enum):
+    Automatic = 'automatic'
+    ManualOff = 'manual-off'
+
+
+@dataclass(frozen=True)
+class Released:
+    pass
+
+
+@dataclass(frozen=True)
+class Holding:
+    at: float
+
+
+@dataclass(frozen=True)
+class ConsumeUntilRelease:
+    pass
+
+
+@dataclass(frozen=True)
+class Normal:
+    pass
+
+
+@dataclass(frozen=True)
+class Preparing:
+    generation: int
+    started: float
+
+
+@dataclass(frozen=True)
+class Counting:
+    generation: int
+    visible_at: float
+
+
+@dataclass(frozen=True)
+class Committed:
+    generation: int
+
+
+@dataclass(frozen=True)
+class PowerState:
+    intent: ScreenIntent = ScreenIntent.Automatic
+    gesture: object = Released()
+    phase: object = Normal()
+    generation: int = 0
+
+
+@dataclass(frozen=True)
+class PowerEvent:
+    kind: str
+    at: float
+    generation: int = 0
+    blanked: bool = False
+
+
+def transition(state, event):
+    phase, gesture = state.phase, state.gesture
+    if isinstance(phase, Committed):
+        if event.kind == 'shutdown-failed' and event.generation == phase.generation:
+            return replace(state, phase=Normal(), generation=state.generation + 1,
+                           gesture=ConsumeUntilRelease() if not isinstance(gesture, Released) else Released()), ['restore', 'error']
+        return state, []
+    confirming = isinstance(phase, (Preparing, Counting))
+    if event.kind in ('lost', 'failed'):
+        if event.kind == 'failed' and (not confirming or event.generation != phase.generation):
+            return state, []
+        gesture = (ConsumeUntilRelease() if event.kind == 'lost' or not isinstance(gesture, Released)
+                   else Released())
+        return replace(state, phase=Normal(), gesture=gesture,
+                       generation=state.generation + 1), ['restore'] if confirming else []
+    if event.kind == 'down':
+        if not isinstance(gesture, Released):
+            return state, []
+        if confirming:
+            return replace(state, phase=Normal(), gesture=ConsumeUntilRelease(),
+                           generation=state.generation + 1), ['restore']
+        return replace(state, gesture=Holding(event.at)), []
+    if event.kind == 'up':
+        if isinstance(gesture, ConsumeUntilRelease):
+            return replace(state, gesture=Released()), []
+        if not isinstance(gesture, Holding):
+            return state, []
+        if event.at < gesture.at:
+            return replace(state, gesture=ConsumeUntilRelease()), []
+        if event.at - gesture.at < HOLD_S:
+            intent = (ScreenIntent.Automatic if state.intent == ScreenIntent.ManualOff or event.blanked
+                      else ScreenIntent.ManualOff)
+            return replace(state, gesture=Released(), intent=intent), ['screen']
+        generation = state.generation + 1
+        return replace(state, gesture=Released(), generation=generation,
+                       phase=Preparing(generation, event.at)), ['prepare']
+    if event.kind == 'visible' and isinstance(phase, Preparing) and event.generation == phase.generation:
+        return replace(state, phase=Counting(phase.generation, event.at)), []
+    if event.kind == 'tick':
+        if isinstance(gesture, Holding) and isinstance(phase, Normal) and event.at >= gesture.at + HOLD_S:
+            generation = state.generation + 1
+            return replace(state, gesture=ConsumeUntilRelease(), generation=generation,
+                           phase=Preparing(generation, event.at)), ['prepare']
+        if isinstance(phase, Preparing) and event.at >= phase.started + PREPARE_S:
+            return replace(state, phase=Normal(),
+                           gesture=Released() if isinstance(gesture, Released) else ConsumeUntilRelease(),
+                           generation=state.generation + 1), ['restore']
+        if isinstance(phase, Counting) and event.at >= phase.visible_at + COUNTDOWN_S:
+            return replace(state, phase=Committed(phase.generation)), ['shutdown']
+    return state, []
+
+
+def next_deadline(state):
+    if isinstance(state.phase, Preparing):
+        return state.phase.started + PREPARE_S
+    if isinstance(state.phase, Counting):
+        return state.phase.visible_at + COUNTDOWN_S
+    if isinstance(state.phase, Normal) and isinstance(state.gesture, Holding):
+        return state.gesture.at + HOLD_S
+    return None
+
+
+def report(error):
+    print(f'surface-idle: {error}', file=sys.stderr, flush=True)
+
+
+def ioc_read(number, size):
+    return (2 << 30) | (size << 16) | (ord('E') << 8) | number
+
+
+def ioctl_bytes(fd, number, size):
+    value = bytearray(size)
+    fcntl.ioctl(fd, ioc_read(number, size), value, True)
+    return value
+
+
+def bit_set(bits, bit):
+    return bool(bits[bit // 8] & (1 << (bit % 8)))
+
+
+class PowerInput:
+    def __init__(self, fd):
+        self.fd = fd
+        self.buffer = bytearray()
+        self.dropped = False
+
+    @classmethod
+    def discover(cls):
+        matches = []
+        try:
+            for path in sorted(Path('/dev/input').glob('event*')):
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+                try:
+                    name = bytes(ioctl_bytes(fd, 0x06, 256)).split(b'\0', 1)[0]
+                    if (name == b'gpio-keys' and bit_set(ioctl_bytes(fd, 0x20, 8), 1)
+                            and bit_set(ioctl_bytes(fd, 0x21, 96), KEY_POWER)):
+                        matches.append(fd)
+                        fd = -1
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+            if len(matches) != 1:
+                raise RuntimeError(f'expected one gpio-keys Power device, found {len(matches)}')
+            fd = matches[0]
+            fcntl.ioctl(fd, (1 << 30) | (4 << 16) | (ord('E') << 8) | 0xa0,
+                        struct.pack('i', time.CLOCK_MONOTONIC))
+            device = cls(fd)
+            device.down()
+            return device
+        except Exception:
+            for fd in matches:
+                os.close(fd)
+            raise
+
+    def down(self):
+        return bit_set(ioctl_bytes(self.fd, 0x18, 96), KEY_POWER)
+
+    def decode(self, chunk):
+        self.buffer.extend(chunk)
+        events = []
+        while len(self.buffer) >= INPUT_EVENT.size:
+            seconds, micros, kind, code, value = INPUT_EVENT.unpack_from(self.buffer)
+            del self.buffer[:INPUT_EVENT.size]
+            at = seconds + micros / 1000000
+            if not 0 <= micros < 1000000:
+                raise ValueError('invalid evdev timestamp')
+            if kind == 0 and code == 3:
+                self.dropped = True
+                events.append(PowerEvent('lost', at))
+            elif self.dropped:
+                if kind == 0 and code == 0:
+                    if not self.down():
+                        events.append(PowerEvent('up', at))
+                    self.dropped = False
+            elif kind == 1 and code == KEY_POWER:
+                if value in (0, 1):
+                    events.append(PowerEvent('down' if value else 'up', at))
+                elif value != 2:
+                    raise ValueError('invalid Power key value')
+        return events
+
+    def drain(self):
+        events = []
+        while True:
+            try:
+                chunk = os.read(self.fd, INPUT_EVENT.size * 64)
+            except BlockingIOError:
+                return events
+            if not chunk:
+                raise EOFError('Power input disconnected')
+            events.extend(self.decode(chunk))
+
+    def close(self):
+        os.close(self.fd)
+
+
+class Backlight:
+    def __init__(self, root=Path('/sys/class/backlight')):
+        panels = []
+        for path in root.iterdir():
+            if path.name != 'backlight':
+                continue
+            device = (path / 'device').resolve(strict=True)
+            if any((p / 'driver').is_symlink() and (p / 'driver').resolve().name == 'pwm-backlight'
+                   for p in (device, *device.parents)):
+                panels.append(path)
+        if len(panels) != 1:
+            raise RuntimeError('unknown or ambiguous pwm-backlight panel')
+        self.path = panels[0]
+        self.maximum = int((self.path / 'max_brightness').read_text())
+        if self.maximum <= 0:
+            raise ValueError('invalid maximum panel brightness')
+        self.saved = None
+        self.snapshot()
+
+    def read(self):
+        value = int((self.path / 'brightness').read_text())
+        if not 0 <= value <= self.maximum:
+            raise ValueError('invalid panel brightness')
+        return value
+
+    def snapshot(self):
+        value = self.read()
+        if not value:
+            try:
+                value = int((self.path / 'actual_brightness').read_text())
+            except FileNotFoundError:
+                value = 0
+        if 0 < value <= self.maximum:
+            self.saved = value
+
+    def set(self, lit):
+        if not lit:
+            self.snapshot()
+        elif self.saved is None:
+            self.snapshot()
+            if self.saved is None:
+                raise RuntimeError('original positive panel brightness is unknown')
+        value = self.saved if lit else 0
+        (self.path / 'brightness').write_text(str(value))
+        if self.read() != value:
+            raise RuntimeError('panel brightness readback differs')
+
+
+class LeaseServer:
+    def __init__(self, path=SOCKET_PATH, uid=None):
+        self.path = Path(path)
+        self.uid = os.getuid() if uid is None else uid
+        self.allowed = True
+        self.clients = {}
+        self.granted = set()
+        if self.path.exists():
+            if not stat.S_ISSOCK(self.path.lstat().st_mode):
+                raise RuntimeError('presentation socket path is not a socket')
+            probe = socket.socket(socket.AF_UNIX)
+            try:
+                probe.connect(str(self.path))
+            except ConnectionRefusedError:
+                self.path.unlink()
+            else:
+                raise RuntimeError('presentation controller already running')
+            finally:
+                probe.close()
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(self.path))
+        os.chmod(self.path, 0o600)
+        self.listener.listen(8)
+        self.listener.setblocking(False)
+
+    def fds(self):
+        return [self.listener, *self.clients]
+
+    def drop(self, client):
+        self.granted.discard(client)
+        self.clients.pop(client, None)
+        client.close()
+
+    def revoke(self):
+        self.allowed = False
+        for client in tuple(self.clients):
+            if client in self.granted:
+                try:
+                    client.sendall(b'surface-power-v1 revoke\n')
+                except OSError:
+                    self.drop(client)
+            else:
+                self.drop(client)
+
+    def poll(self, on_acquire):
+        while True:
+            try:
+                client, _ = self.listener.accept()
+            except BlockingIOError:
+                break
+            client.setblocking(False)
+            _, uid, _ = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid != self.uid or len(self.clients) >= 16:
+                client.close()
+            else:
+                self.clients[client] = (bytearray(), time.monotonic() + 2)
+        for client, (buffer, deadline) in tuple(self.clients.items()):
+            try:
+                data = client.recv(128)
+                if not data:
+                    self.drop(client)
+                    continue
+                if client in self.granted:
+                    self.drop(client)
+                    continue
+                buffer.extend(data)
+                if len(buffer) > 64 or (b'\n' in buffer and buffer != b'surface-power-v1 acquire\n'):
+                    self.drop(client)
+                elif buffer == b'surface-power-v1 acquire\n':
+                    if not self.allowed or self.granted:
+                        client.sendall(b'surface-power-v1 busy\n')
+                        self.drop(client)
+                    else:
+                        on_acquire()
+                        self.granted.add(client)
+                        client.sendall(b'surface-power-v1 granted\n')
+            except BlockingIOError:
+                if client not in self.granted and time.monotonic() >= deadline:
+                    self.drop(client)
+            except (OSError, RuntimeError) as error:
+                report(error)
+                self.drop(client)
+
+    def close(self):
+        for client in tuple(self.clients):
+            self.drop(client)
+        self.listener.close()
+        self.path.unlink(missing_ok=True)
+
+
+def bind(lib, name, args, result=C.c_int):
+    fn = getattr(lib, name)
+    fn.argtypes, fn.restype = args, result
+    return fn
+
+
+class XEvent(C.Union):
+    _fields_ = [('type', C.c_int), ('pad', C.c_long * 24)]
 
 
 class FontHead(C.Structure):
     _fields_ = [('ext_data', C.c_void_p), ('fid', C.c_ulong)]
 
 
-def status():
-    net = f'/sys/class/net/{IFACE}'
-    if not os.path.isdir(net):
-        return 'No network adapter. Plug the USB ethernet adapter into the Surface.'
+class SetWindowAttributes(C.Structure):
+    _fields_ = [('background_pixmap', C.c_ulong), ('background_pixel', C.c_ulong),
+                ('border_pixmap', C.c_ulong), ('border_pixel', C.c_ulong),
+                ('bit_gravity', C.c_int), ('win_gravity', C.c_int), ('backing_store', C.c_int),
+                ('backing_planes', C.c_ulong), ('backing_pixel', C.c_ulong),
+                ('save_under', C.c_int), ('event_mask', C.c_long),
+                ('do_not_propagate_mask', C.c_long), ('override_redirect', C.c_int),
+                ('colormap', C.c_ulong), ('cursor', C.c_ulong)]
+
+
+class WindowAttributes(C.Structure):
+    _fields_ = [('x', C.c_int), ('y', C.c_int), ('width', C.c_int), ('height', C.c_int),
+                ('border_width', C.c_int), ('depth', C.c_int), ('visual', C.c_void_p),
+                ('root', C.c_ulong), ('window_class', C.c_int), ('bit_gravity', C.c_int),
+                ('win_gravity', C.c_int), ('backing_store', C.c_int),
+                ('backing_planes', C.c_ulong), ('backing_pixel', C.c_ulong),
+                ('save_under', C.c_int), ('colormap', C.c_ulong), ('map_installed', C.c_int),
+                ('map_state', C.c_int), ('all_event_masks', C.c_long),
+                ('your_event_mask', C.c_long), ('do_not_propagate_mask', C.c_long),
+                ('override_redirect', C.c_int), ('screen', C.c_void_p)]
+
+
+def network_status():
+    net = Path('/sys/class/net/eth0')
     try:
-        with open(f'{net}/carrier') as f:
-            carrier = f.read().strip()
+        if (net / 'carrier').read_text().strip() == '1':
+            return 'Waiting for the PC (10.42.0.1) to connect.'
     except OSError:
-        carrier = '0'
-    if carrier != '1':
-        return 'No network link. Connect the ethernet cable to the PC.'
-    return f'Waiting for the PC ({PC}) to connect.'
+        pass
+    return ('No network link. Connect the ethernet cable to the PC.' if net.exists()
+            else 'No network adapter. Plug the USB ethernet adapter into the Surface.')
 
 
-def xset(*args):
-    subprocess.run(['xset', *args], check=False)
-
-
-def main():
-    x = C.CDLL('libX11.so.6')
-    p, u = C.c_void_p, C.c_ulong
-    for name, args, res in (
+class Renderer:
+    def __init__(self):
+        self.x = C.CDLL('libX11.so.6')
+        self.display = None
+        self.window = 0
+        self.gc = self.font = None
+        p, u = C.c_void_p, C.c_ulong
+        for name, args, result in (
             ('XOpenDisplay', [C.c_char_p], p), ('XDefaultScreen', [p], C.c_int),
             ('XRootWindow', [p, C.c_int], u), ('XDisplayWidth', [p, C.c_int], C.c_int),
             ('XDisplayHeight', [p, C.c_int], C.c_int), ('XWhitePixel', [p, C.c_int], u),
             ('XBlackPixel', [p, C.c_int], u),
             ('XCreateSimpleWindow', [p, u, C.c_int, C.c_int, C.c_uint, C.c_uint, C.c_uint, u, u], u),
-            ('XSelectInput', [p, u, C.c_long], C.c_int), ('XCreateGC', [p, u, u, p], p),
-            ('XSetForeground', [p, p, u], C.c_int), ('XLoadQueryFont', [p, C.c_char_p], p),
-            ('XSetFont', [p, p, u], C.c_int), ('XTextWidth', [p, C.c_char_p, C.c_int], C.c_int),
-            ('XMapWindow', [p, u], C.c_int), ('XClearWindow', [p, u], C.c_int),
+            ('XChangeWindowAttributes', [p, u, u, C.POINTER(SetWindowAttributes)], C.c_int),
+            ('XStoreName', [p, u, C.c_char_p], C.c_int), ('XSelectInput', [p, u, C.c_long], C.c_int),
+            ('XCreateGC', [p, u, u, p], p), ('XSetForeground', [p, p, u], C.c_int),
+            ('XLoadQueryFont', [p, C.c_char_p], p), ('XSetFont', [p, p, u], C.c_int),
+            ('XTextWidth', [p, C.c_char_p, C.c_int], C.c_int), ('XMapRaised', [p, u], C.c_int),
+            ('XLowerWindow', [p, u], C.c_int), ('XRaiseWindow', [p, u], C.c_int),
+            ('XClearWindow', [p, u], C.c_int),
             ('XDrawString', [p, u, p, C.c_int, C.c_int, C.c_char_p, C.c_int], C.c_int),
-            ('XFlush', [p], C.c_int), ('XPending', [p], C.c_int),
-            ('XNextEvent', [p, C.POINTER(Event)], C.c_int), ('XConnectionNumber', [p], C.c_int)):
-        fn = getattr(x, name)
-        fn.argtypes, fn.restype = args, res
+            ('XSync', [p, C.c_int], C.c_int), ('XPending', [p], C.c_int),
+            ('XNextEvent', [p, C.POINTER(XEvent)], C.c_int), ('XConnectionNumber', [p], C.c_int),
+            ('XGetWindowAttributes', [p, u, C.POINTER(WindowAttributes)], C.c_int),
+            ('XFreeFont', [p, p], C.c_int), ('XFreeGC', [p, p], C.c_int),
+            ('XDestroyWindow', [p, u], C.c_int), ('XCloseDisplay', [p], C.c_int)):
+            bind(self.x, name, args, result)
+        self.display = self.x.XOpenDisplay(None)
+        if not self.display:
+            raise RuntimeError('cannot open X11 display')
+        try:
+            scr = self.x.XDefaultScreen(self.display)
+            self.root = self.x.XRootWindow(self.display, scr)
+            self.width = self.x.XDisplayWidth(self.display, scr)
+            self.height = self.x.XDisplayHeight(self.display, scr)
+            black = self.x.XBlackPixel(self.display, scr)
+            self.window = self.x.XCreateSimpleWindow(self.display, self.root, 0, 0,
+                                                    self.width, self.height, 0, black, black)
+            if not self.window:
+                raise RuntimeError('cannot create Power window')
+            attrs = SetWindowAttributes()
+            attrs.override_redirect = 1
+            self.x.XChangeWindowAttributes(self.display, self.window, 1 << 9, C.byref(attrs))
+            self.x.XStoreName(self.display, self.window, b'Surface Power')
+            self.x.XSelectInput(self.display, self.window, 1 << 15)
+            self.gc = self.x.XCreateGC(self.display, self.window, 0, None)
+            self.x.XSetForeground(self.display, self.gc, self.x.XWhitePixel(self.display, scr))
+            for name in (b'10x20', b'9x15', b'fixed'):
+                self.font = self.x.XLoadQueryFont(self.display, name)
+                if self.font:
+                    break
+            if not self.font:
+                raise RuntimeError('no X11 text font available')
+            self.x.XSetFont(self.display, self.gc, FontHead.from_address(self.font).fid)
+            self.x.XMapRaised(self.display, self.window)
+            self.lines = None
+            self.draw_idle()
+        except Exception:
+            self.close()
+            raise
 
-    d = x.XOpenDisplay(None)
-    if not d:
-        raise SystemExit('surface-idle: cannot open display')
-    scr = x.XDefaultScreen(d)
-    root = x.XRootWindow(d, scr)
-    width, height = x.XDisplayWidth(d, scr), x.XDisplayHeight(d, scr)
-    black = x.XBlackPixel(d, scr)
-    win = x.XCreateSimpleWindow(d, root, 0, 0, width, height, 0, black, black)
-    x.XSelectInput(d, win, EXPOSURE_MASK)
-    x.XSelectInput(d, root, SUBSTRUCTURE_NOTIFY_MASK)
-    gc = x.XCreateGC(d, win, 0, None)
-    x.XSetForeground(d, gc, x.XWhitePixel(d, scr))
-    font = next(f for f in (x.XLoadQueryFont(d, n) for n in (b'10x20', b'9x15', b'fixed')) if f)
-    x.XSetFont(d, gc, FontHead.from_address(font).fid)
-    x.XMapWindow(d, win)
+    def fileno(self):
+        return self.x.XConnectionNumber(self.display)
 
-    def draw(lines):
-        x.XClearWindow(d, win)
-        for i, line in enumerate(lines):
-            text = line.encode()
-            x.XDrawString(d, win, gc, (width - x.XTextWidth(font, text, len(text))) // 2,
-                          height // 2 + 30 * i, text, len(text))
-        x.XFlush(d)
+    def draw(self, lines, raised=True):
+        self.lines = tuple(lines)
+        if raised:
+            self.x.XMapRaised(self.display, self.window)
+        self.x.XClearWindow(self.display, self.window)
+        start = (self.height - 36 * (len(lines) - 1)) // 2
+        for index, line in enumerate(lines):
+            text = line.encode('ascii')
+            self.x.XDrawString(self.display, self.window, self.gc,
+                              max(0, (self.width - self.x.XTextWidth(self.font, text, len(text))) // 2),
+                              start + 36 * index, text, len(text))
+        self.x.XSync(self.display, 0)
 
-    xset('dpms', '0', '0', str(BLANK_S), 's', 'reset')
-    receivers = set()
-    shown = None
-    event = Event()
-    fd = x.XConnectionNumber(d)
-    while True:
-        while x.XPending(d):
-            x.XNextEvent(d, C.byref(event))
-            if event.type == EXPOSE:
-                shown = None
-            elif event.any.window == win:
-                continue
-            elif event.type == MAP_NOTIFY:
-                receivers.add(event.any.window)
-            elif event.type in (UNMAP_NOTIFY, DESTROY_NOTIFY) and event.any.window in receivers:
-                receivers.discard(event.any.window)
-                if not receivers:
-                    xset('dpms', '0', '0', str(BLANK_S), 's', 'reset')
-        text = status()
-        if text != shown:
-            draw(['Surface RT display', text])
-            shown = text
-        select.select([fd], [], [], 1.0)
+    def draw_countdown(self, seconds):
+        self.draw([f'Shutting down in {seconds} seconds.', 'Press Power again to cancel.',
+                   'Release the held Power button now.'])
+
+    def draw_idle(self, message=None):
+        self.draw(['Surface RT display', message or network_status()], raised=False)
+        self.x.XLowerWindow(self.display, self.window)
+        self.x.XSync(self.display, 0)
+
+    def poll(self):
+        exposed = False
+        event = XEvent()
+        while self.x.XPending(self.display):
+            self.x.XNextEvent(self.display, C.byref(event))
+            exposed |= event.type == 12
+        if exposed and self.lines:
+            self.draw(self.lines, raised=False)
+
+    def viewable(self):
+        attrs = WindowAttributes()
+        return bool(self.x.XGetWindowAttributes(self.display, self.window, C.byref(attrs))
+                    and attrs.map_state == 2 and attrs.width == self.width and attrs.height == self.height)
+
+    def close(self):
+        if self.display:
+            if self.font:
+                self.x.XFreeFont(self.display, self.font)
+            if self.gc:
+                self.x.XFreeGC(self.display, self.gc)
+            if self.window:
+                self.x.XDestroyWindow(self.display, self.window)
+            self.x.XCloseDisplay(self.display)
+            self.display = None
+
+
+class DisplayPolicy:
+    def __init__(self, renderer):
+        self.renderer = renderer
+        self.ext = C.CDLL('libXext.so.6')
+        p = C.c_void_p
+        for name, args in (
+            ('DPMSCapable', [p]), ('DPMSEnable', [p]), ('DPMSDisable', [p]),
+            ('DPMSForceLevel', [p, C.c_ushort]),
+            ('DPMSSetTimeouts', [p, C.c_ushort, C.c_ushort, C.c_ushort]),
+            ('DPMSInfo', [p, C.POINTER(C.c_ushort), C.POINTER(C.c_ubyte)])):
+            bind(self.ext, name, args)
+        bind(renderer.x, 'XResetScreenSaver', [p])
+        if not self.ext.DPMSCapable(renderer.display):
+            raise RuntimeError('display has no DPMS capability')
+
+    def blanked(self):
+        level, enabled = C.c_ushort(), C.c_ubyte()
+        if not self.ext.DPMSInfo(self.renderer.display, C.byref(level), C.byref(enabled)):
+            raise RuntimeError('cannot query DPMS state')
+        return level.value != 0
+
+    def awake(self):
+        d = self.renderer.display
+        if not self.ext.DPMSEnable(d) or not self.ext.DPMSForceLevel(d, 0) or not self.ext.DPMSDisable(d):
+            raise RuntimeError('cannot force panel scanout on')
+        self.renderer.x.XResetScreenSaver(d)
+        self.renderer.x.XSync(d, 0)
+        if self.blanked():
+            raise RuntimeError('panel scanout remains off')
+
+    def idle(self):
+        d = self.renderer.display
+        if not self.ext.DPMSEnable(d) or not self.ext.DPMSSetTimeouts(d, 0, 0, BLANK_S):
+            raise RuntimeError('cannot restore automatic panel blanking')
+        self.renderer.x.XResetScreenSaver(d)
+        self.renderer.x.XSync(d, 0)
+
+
+class VBlankRequest(C.Structure):
+    _fields_ = [('type', C.c_uint), ('sequence', C.c_uint), ('signal', C.c_ulong)]
+
+
+class VBlankReply(C.Structure):
+    _fields_ = [('type', C.c_uint), ('sequence', C.c_uint), ('seconds', C.c_long), ('microseconds', C.c_long)]
+
+
+class VBlank(C.Union):
+    _fields_ = [('request', VBlankRequest), ('reply', VBlankReply)]
+
+
+class Cookie(C.Structure):
+    _fields_ = [('sequence', C.c_uint)]
+
+
+class AuthReply(C.Structure):
+    _fields_ = [('response_type', C.c_uint8), ('pad', C.c_uint8), ('sequence', C.c_uint16),
+                ('length', C.c_uint32), ('authenticated', C.c_uint32)]
+
+
+class TegraVisibility:
+    def __init__(self, renderer):
+        self.renderer = renderer
+        self.port = None
+        self.gpu = -1
+        self.sequence = None
+        self.progress_at = None
+        self.xv = C.CDLL('libXv.so.1')
+        self.drm = C.CDLL('libdrm.so.2', use_errno=True)
+        p, u = C.c_void_p, C.c_ulong
+        for name, args in (
+            ('XvQueryAdaptors', [p, u, C.POINTER(C.c_uint), C.POINTER(p)]),
+            ('XvFreeAdaptorInfo', [p]), ('XvGrabPort', [p, u, u]),
+            ('XvUngrabPort', [p, u, u]), ('XvStopVideo', [p, u, u]),
+            ('XvGetPortAttribute', [p, u, u, C.POINTER(C.c_int)])):
+            bind(self.xv, name, args)
+        bind(renderer.x, 'XInternAtom', [p, C.c_char_p, C.c_int], u)
+        bind(self.drm, 'drmOpen', [C.c_char_p, C.c_char_p])
+        bind(self.drm, 'drmGetMagic', [C.c_int, C.POINTER(C.c_uint32)])
+        bind(self.drm, 'drmWaitVBlank', [C.c_int, C.POINTER(VBlank)])
+
+    def acquire(self):
+        r = self.renderer
+        count, adaptors = C.c_uint(), C.c_void_p()
+        if self.xv.XvQueryAdaptors(r.display, r.root, C.byref(count), C.byref(adaptors)) or not count.value:
+            raise RuntimeError('no Xv adaptor for overlay exclusion')
+        try:
+            port = C.cast(adaptors, C.POINTER(C.c_ulong))[0]
+        finally:
+            self.xv.XvFreeAdaptorInfo(adaptors)
+        if self.xv.XvGrabPort(r.display, port, 0):
+            return False
+        self.port = port
+        if self.xv.XvStopVideo(r.display, port, r.window):
+            raise RuntimeError('cannot stop overlay video')
+        r.x.XSync(r.display, 0)
+        self.atom = r.x.XInternAtom(r.display, b'XV_TEGRA_VDPAU_INFO', 1)
+        if not self.atom:
+            raise RuntimeError('Tegra overlay visibility attribute unavailable')
+        self.check_overlay()
+        self.gpu = self.drm.drmOpen(b'tegra', None)
+        if self.gpu < 0:
+            raise OSError(C.get_errno(), 'drmOpen(tegra)')
+        magic = C.c_uint32()
+        if self.drm.drmGetMagic(self.gpu, C.byref(magic)):
+            raise OSError(C.get_errno(), 'drmGetMagic')
+        p = C.c_void_p
+        x11xcb, dri = C.CDLL('libX11-xcb.so.1'), C.CDLL('libxcb-dri2.so.0')
+        connection = bind(x11xcb, 'XGetXCBConnection', [p], p)(r.display)
+        auth = bind(dri, 'xcb_dri2_authenticate', [p, C.c_uint32, C.c_uint32], Cookie)
+        reply_fn = bind(dri, 'xcb_dri2_authenticate_reply', [p, Cookie, p], C.POINTER(AuthReply))
+        reply = reply_fn(connection, auth(connection, r.root, magic.value), None)
+        authenticated = bool(reply and reply.contents.authenticated)
+        if reply:
+            bind(C.CDLL(None), 'free', [p], None)(reply)
+        if not authenticated:
+            raise RuntimeError('DRI2 panel-vblank authentication failed')
+        return True
+
+    def check_overlay(self):
+        info = C.c_int()
+        if self.xv.XvGetPortAttribute(self.renderer.display, self.port, self.atom, C.byref(info)):
+            raise RuntimeError('cannot query Tegra overlay visibility')
+        if info.value & 1:
+            raise RuntimeError('overlay still visible over Power confirmation')
+
+    def query_sequence(self):
+        event = VBlank()
+        event.request.type = 0x20000000 | 1
+        event.request.sequence = 0
+        if self.drm.drmWaitVBlank(self.gpu, C.byref(event)):
+            raise OSError(C.get_errno(), 'nonblocking panel vblank query')
+        return event.reply.sequence
+
+    def begin(self, now):
+        self.sequence = self.query_sequence()
+        self.progress_at = now
+
+    def visible(self, now):
+        r = self.renderer
+        self.check_overlay()
+        r.x.XRaiseWindow(r.display, r.window)
+        r.x.XSync(r.display, 0)
+        if not r.viewable():
+            raise RuntimeError('Power confirmation window is not viewable')
+        sequence = self.query_sequence()
+        progressed = sequence != self.sequence
+        if progressed:
+            self.sequence, self.progress_at = sequence, now
+        elif now - self.progress_at > 0.5:
+            raise RuntimeError('panel vblank stopped advancing')
+        return progressed
+
+    def close(self):
+        if self.port is not None:
+            r = self.renderer
+            self.xv.XvUngrabPort(r.display, self.port, 0)
+            r.x.XSync(r.display, 0)
+            self.port = None
+        if self.gpu >= 0:
+            os.close(self.gpu)
+            self.gpu = -1
+        self.sequence = None
+
+
+class Controller:
+    def __init__(self, renderer, display, backlight, leases, visibility, poweroff=None, clock=None):
+        self.renderer, self.display, self.backlight = renderer, display, backlight
+        self.leases, self.visibility = leases, visibility
+        self.state = PowerState()
+        self.poweroff = poweroff or self.start_poweroff
+        self.process = None
+        self.drawn = None
+        self.error_message = None
+        self.clock = clock or time.monotonic
+
+    @staticmethod
+    def start_poweroff():
+        return subprocess.Popen(['doas', '-n', '/sbin/poweroff'], stdin=subprocess.DEVNULL)
+
+    def apply(self, event):
+        self.state, effects = transition(self.state, event)
+        for effect in effects:
+            try:
+                if effect == 'prepare':
+                    self.leases.revoke()
+                    self.drawn = None
+                    self.error_message = None
+                elif effect == 'restore':
+                    self.restore()
+                elif effect == 'screen':
+                    self.backlight.set(self.state.intent == ScreenIntent.Automatic)
+                    if self.state.intent == ScreenIntent.Automatic:
+                        self.display.awake()
+                        if not self.leases.granted:
+                            self.display.idle()
+                elif effect == 'shutdown':
+                    self.process = self.poweroff()
+                elif effect == 'error':
+                    self.error_message = 'Shutdown failed. Hold Power again to retry.'
+                    report(self.error_message)
+                    self.renderer.draw_idle(self.error_message)
+            except Exception as error:
+                report(error)
+                phase = self.state.phase
+                if isinstance(phase, Committed):
+                    self.apply(PowerEvent('shutdown-failed', self.clock(), phase.generation))
+                elif isinstance(phase, (Preparing, Counting)):
+                    self.apply(PowerEvent('failed', self.clock(), phase.generation))
+                else:
+                    self.leases.allowed = False
+                    raise
+
+    def restore(self):
+        self.leases.allowed = False
+        self.backlight.set(self.state.intent == ScreenIntent.Automatic)
+        self.renderer.draw_idle(self.error_message)
+        self.visibility.close()
+        self.drawn = None
+        if self.leases.granted:
+            self.display.awake()
+        else:
+            self.display.idle()
+        self.leases.allowed = True
+
+    def acquire_receiver(self):
+        self.display.awake()
+        if self.state.intent == ScreenIntent.ManualOff:
+            self.backlight.set(False)
+
+    def poll(self, now):
+        phase = self.state.phase
+        if isinstance(phase, (Preparing, Counting)):
+            try:
+                if isinstance(phase, Preparing) and now >= phase.started + PREPARE_S:
+                    raise RuntimeError('Power confirmation preparation exceeded five seconds')
+                if isinstance(phase, Preparing) and self.visibility.port is None:
+                    if self.leases.granted or not self.visibility.acquire():
+                        self.apply(PowerEvent('tick', now))
+                        return
+                    self.display.awake()
+                    self.backlight.set(True)
+                    self.renderer.draw_countdown(30)
+                    self.visibility.begin(self.clock())
+                if self.backlight.read() <= 0 or self.display.blanked():
+                    raise RuntimeError('Power confirmation illumination lost')
+                progressed = self.visibility.visible(now)
+                if isinstance(phase, Preparing):
+                    if progressed:
+                        visible_at = self.clock()
+                        if visible_at >= phase.started + PREPARE_S:
+                            raise RuntimeError('Power confirmation preparation exceeded five seconds')
+                        self.apply(PowerEvent('visible', visible_at, phase.generation))
+                else:
+                    seconds = max(0, math.ceil(phase.visible_at + COUNTDOWN_S - now))
+                    if seconds != self.drawn:
+                        self.renderer.draw_countdown(seconds)
+                        self.drawn = seconds
+                    if now >= phase.visible_at + COUNTDOWN_S and not progressed:
+                        return
+            except Exception as error:
+                report(error)
+                self.apply(PowerEvent('failed', now, phase.generation))
+                return
+        self.apply(PowerEvent('tick', now))
+        if self.process is not None:
+            result = self.process.poll()
+            if result is not None:
+                self.process = None
+                if result:
+                    self.apply(PowerEvent('shutdown-failed', now, self.state.generation))
+
+
+def main():
+    renderer = leases = visibility = device = None
+    try:
+        renderer = Renderer()
+        display = DisplayPolicy(renderer)
+        backlight = Backlight()
+        leases = LeaseServer()
+        visibility = TegraVisibility(renderer)
+        controller = Controller(renderer, display, backlight, leases, visibility)
+        display.idle()
+        retry_at = 0
+        idle_at = 0
+        had_lease = False
+        while True:
+            now = time.monotonic()
+            if device is None and now >= retry_at:
+                try:
+                    device = PowerInput.discover()
+                    controller.apply(PowerEvent('lost', now))
+                    if not device.down():
+                        controller.apply(PowerEvent('up', now))
+                except Exception as error:
+                    report(error)
+                    if device is not None:
+                        device.close()
+                    device = None
+                    retry_at = now + 2
+            if device is not None:
+                try:
+                    for event in device.drain():
+                        if event.at > time.monotonic() + 0.1:
+                            raise ValueError('Power input clock is not monotonic')
+                        if event.kind == 'up' and isinstance(controller.state.gesture, Holding):
+                            event = replace(event, blanked=display.blanked())
+                        controller.apply(event)
+                    state = controller.state
+                    if (isinstance(state.gesture, Holding) and now >= state.gesture.at + HOLD_S
+                            and not device.down()):
+                        controller.apply(PowerEvent('lost', now))
+                except Exception as error:
+                    report(error)
+                    controller.apply(PowerEvent('lost', now))
+                    device.close()
+                    device = None
+                    retry_at = now + 2
+            leases.poll(controller.acquire_receiver)
+            if had_lease and not leases.granted and isinstance(controller.state.phase, Normal):
+                display.idle()
+            had_lease = bool(leases.granted)
+            renderer.poll()
+            controller.poll(time.monotonic())
+            if isinstance(controller.state.phase, Normal) and time.monotonic() >= idle_at:
+                renderer.draw_idle(controller.error_message)
+                idle_at = time.monotonic() + 1
+            deadline = next_deadline(controller.state)
+            timeout = 0.05
+            if deadline is not None:
+                timeout = min(timeout, max(0, deadline - time.monotonic()))
+            fds = [renderer.fileno(), *leases.fds()]
+            if device is not None:
+                fds.append(device.fd)
+            select.select(fds, [], [], timeout)
+    except Exception as error:
+        report(error)
+        return 1
+    finally:
+        if device is not None:
+            device.close()
+        if leases is not None:
+            leases.close()
+        if visibility is not None:
+            visibility.close()
+        if renderer is not None:
+            renderer.close()
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

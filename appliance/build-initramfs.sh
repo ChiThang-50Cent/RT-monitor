@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 OUT" >&2
+    echo "Usage: $0 OUT [RELEASE_CONF]" >&2
     exit 1
 fi
 
@@ -11,6 +11,11 @@ HERE=$(dirname "$(realpath "$0")")
 CACHE_DIR="$HOME/.cache/surface-appliance/apks"
 LOCK_FILE="$HERE/packages.lock"
 INIT_SRC="$HERE/initramfs/init"
+DESCRIPTOR="${2:-}"
+if [ -n "$DESCRIPTOR" ] && [ ! -f "$DESCRIPTOR" ]; then
+    echo "release descriptor missing: $DESCRIPTOR" >&2
+    exit 1
+fi
 
 if [ ! -f "$LOCK_FILE" ]; then
     echo "packages.lock missing at $LOCK_FILE" >&2
@@ -56,7 +61,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 INITFS="$WORK/initfs"
 mkdir -p "$INITFS/bin" "$INITFS/sbin" "$INITFS/dev" "$INITFS/proc" "$INITFS/sys" \
-         "$INITFS/media/boot" "$INITFS/ro_squash" "$INITFS/overlay_tmpfs" "$INITFS/sysroot" \
+         "$INITFS/media/boot" "$INITFS/ro_squash" "$INITFS/ro_base" "$INITFS/ro_extension" "$INITFS/overlay_tmpfs" "$INITFS/sysroot" \
          "$INITFS/lib/modules/$REL"
 
 echo "Extracting busybox-static..."
@@ -116,11 +121,15 @@ done
 
 cp -p "$INIT_SRC" "$INITFS/init"
 chmod 755 "$INITFS/init"
+if [ -n "$DESCRIPTOR" ]; then
+    sha256sum "$DESCRIPTOR" | cut -d ' ' -f 1 > "$INITFS/extension-descriptor.sha256"
+fi
 
 mkdir -p "$OUT"
 INITRAMFS_OUT="$OUT/initramfs"
 echo "Creating $INITRAMFS_OUT..."
-(cd "$INITFS" && find . -mindepth 1 | sort | cpio -H newc -R 0:0 -o 2>/dev/null) | gzip -9 > "$INITRAMFS_OUT"
+find "$INITFS" -exec touch -h -d "@${SOURCE_DATE_EPOCH:-0}" {} +
+(cd "$INITFS" && find . -mindepth 1 | LC_ALL=C sort | cpio --reproducible -H newc -R 0:0 -o 2>/dev/null) | gzip -n -9 > "$INITRAMFS_OUT"
 chmod 644 "$INITRAMFS_OUT"
 
 echo "build-initramfs.sh complete: $INITRAMFS_OUT ($(du -h "$INITRAMFS_OUT" | awk '{print $1}'))"

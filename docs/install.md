@@ -7,6 +7,72 @@ Plan about an hour. The first kernel build takes about 11 minutes of full CPU on
 > [!NOTE]
 > The scripts hard-code the tested device: boot partition UUID `17C0-8631`, IP addresses `10.42.0.1` and `10.42.0.2`, and the Surface user `user` with UID 10000. On another device, change these values in `appliance/` and `surface-gud/` first.
 
+## Install internal EFI
+
+This procedure applies to the tested Surface with the preserved appliance release `6258b2a5368a` and the EFI chain already proven on its rescue USB. Keep that USB unchanged. This is not a firmware update or a general Surface RT installer.
+
+The new release contains a small read-only extension over the checked base image. It does not replace or delete the base. The tested boot partition has only 110144 KiB free, so a second full image does not fit.
+
+The build also requires retained local inputs that Git does not contain. Preserve `nura/coldboot/nv-efi-kernel-probe/manifest.json` and its complete `package/`, the frozen `~/surface-releases/6258b2a5368a/rootfs.squashfs`, and the matching `~/.cache/surface-appliance/out/kernel/` build output. The builder verifies the retained EFI package and base hashes. A fresh clone alone cannot reconstruct this device-specific release. Do not commit device backups or private recovery material.
+
+1. From the PC checkout, build the bundle:
+
+	```sh
+	python3 appliance/build-internal-efi.py --out "$HOME/surface-releases/internal-efi"
+	```
+
+	The builder prints the release ID and bundle path. It reuses the proven EFI kernel and device tree, builds the extension and its initramfs, and does not install onto the Surface.
+
+2. Set `BUNDLE` to the printed path and choose a new backup directory on the PC:
+
+	```sh
+	BUNDLE="$HOME/surface-releases/internal-efi/<id>"
+	BACKUP="$PWD/nura/coldboot/internal-efi-backup-$(date +%Y%m%d-%H%M%S)"
+	```
+
+3. Enter APX on the Surface and connect the A-to-A cable.
+4. Run `appliance/load-uboot.sh`.
+5. Select **mount internal storage** in the U-Boot menu.
+6. Inspect the target and bundle:
+
+	```sh
+	python3 appliance/install/internal-efi-pc.py inspect --bundle "$BUNDLE"
+	```
+
+	The tool must identify the USB-exposed internal FAT partition with UUID `17C0-8631` and verify the preserved base. Do not substitute a guessed `/dev/sdX` path.
+
+7. Install the candidate:
+
+	```sh
+	python3 appliance/install/internal-efi-pc.py install --bundle "$BUNDLE" --backup "$BACKUP"
+	```
+
+	The backup stays on the PC. Keep it for recovery. The installer changes only its declared files on the boot partition. It does not format, repartition, change firmware variables, or write partition 2.
+
+8. Wait for successful verification and unmount before leaving USB disk mode.
+9. Power off the Surface, disconnect the A-to-A cable, and reconnect the ethernet adapter.
+10. Press and release **Power** without a Volume button or boot USB.
+11. Verify that Linux starts without menu input and that pinned SSH reports the new `appliance.release` in `/proc/cmdline`.
+12. Confirm that the display stream resumes with advancing real visible ACKs.
+13. Check a short Power press while streaming. The backlight must toggle without losing the network.
+14. Hold Power for about 3 seconds, then release when the confirmation appears. Verify that the release does not cancel.
+15. Press Power again before the visible 30-second countdown expires. Verify cancellation, restored screen intent, and stream reconnection.
+16. After boot and recovery checks succeed, let a new visible countdown expire. Verify clean shutdown and another Power-only cold boot.
+
+Building and locally testing the bundle does not prove the physical checks. If firmware selection, panel visibility, Power events, or clean shutdown has not been observed on the Surface, record that check as unverified.
+
+To restore the prior EFI files, re-enter APX, load RAM U-Boot, select **mount internal storage**, and run:
+
+```sh
+python3 appliance/install/internal-efi-pc.py restore --backup "$BACKUP"
+```
+
+Wait for verification and unmount before leaving USB disk mode. The restore uses the saved hashes and original absences. It must refuse unknown changes rather than delete unrelated files.
+
+The existing `recovery-pc.sh restore` restores `extlinux.conf`, not the EFI chain. Changing its `DEFAULT` affects RAM U-Boot boots only.
+
+The remaining sections describe the original full-image installation and RAM U-Boot recovery path.
+
 ## Check the requirements
 
 You need this hardware:
@@ -68,7 +134,7 @@ Copy the receiver to Nura and start the PC service:
 
 ```sh
 scp -i ~/.ssh/surface_omp -o UserKnownHostsFile=surface-known-hosts \
-	surface-gud/display_receiver.py surface-gud/surface_xv.py surface-gud/surface_protocol.py \
+	surface-gud/display_receiver.py surface-gud/surface_xv.py surface-gud/surface_protocol.py surface-gud/surface_power.py \
 	user@10.42.0.2:/home/user/
 install -Dm644 surface-gud/surface-display.service ~/.config/systemd/user/surface-display.service
 systemctl --user daemon-reload
@@ -83,7 +149,7 @@ journalctl --user -u surface-display.service -f
 
 ## 5. Build the RAM U-Boot
 
-The Surface cannot boot Linux without help. On every power-on, the PC loads U-Boot into the Surface's RAM through APX mode.
+For the original recovery path, the PC loads U-Boot into the Surface's RAM through APX after each power loss. An installed and physically accepted internal EFI release uses its separate Power-only startup path.
 
 1. Install the ARM toolchain and the USB library for the exploit script:
 

@@ -31,8 +31,8 @@ The panel refreshes at 61.78 Hz, not 60 Hz. At 30 frames per second, about 6% of
 
 ## Limits
 
-- The Surface cannot cold-boot on its own. Every power-on goes through APX mode, an A-to-A USB cable to the PC, and a U-Boot that the PC loads into RAM. Writing U-Boot to SPI flash or eMMC boot partitions would remove this step, but this project does not do that.
-- The Surface has one USB port. It holds the A-to-A cable during boot and the USB ethernet adapter after boot.
+- The owner reports successful Power-only internal EFI boot with release `4864cffb6f74e79c22c52c17`, confirmed as the running release over pinned SSH. Startup to the display takes more than five minutes by the owner's estimate; the slow stage is not yet measured. The [internal EFI installer](docs/install.md#install-internal-efi) changes files on the boot filesystem, not SPI or eMMC hardware boot partitions. Keep the rescue USB and APX recovery assets.
+- The Surface has one USB port. APX recovery uses the A-to-A cable; normal internal EFI boot and streaming leave the ethernet adapter connected.
 - Speakers, microphone, cameras, Wi-Fi, and touch input forwarding do not work on the appliance.
 - Scripts hard-code this device: boot partition UUID `17C0-8631`, SSH host key in `surface-known-hosts`, IP addresses `10.42.0.1` and `10.42.0.2`, and user `user` with UID 10000.
 

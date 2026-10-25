@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import select
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -19,6 +18,7 @@ from gi.repository import Gio, GLib, Gst, GstVideo
 
 from surface_protocol import WIDTH, HEIGHT, FPS, read_frame
 from surface_xv import XvPresenter
+from surface_power import AppliancePresentation
 
 
 # 30 FPS on the 61.78 Hz panel: one frame every 2 vblanks from a small jitter queue.
@@ -35,9 +35,10 @@ def main():
     gaps = []
     counts = {'fed': 0, 'decoded': 0}
     state = {'input_eof': False, 'feed_done': False, 'last_present': None,
-             'progress': time.monotonic(), 'signalled': False, 'eos': False}
+             'progress': time.monotonic(), 'signalled': False, 'revoked': False, 'eos': False}
     batch_started = time.monotonic()
     presenter = pipeline = feeder = pacer = session_bus = None
+    lease = None
     ready = collections.deque()
     ready_cv = threading.Condition()
     inhibitors = []
@@ -213,8 +214,7 @@ def main():
                 'org.xfce.ScreenSaver', '/org/xfce/ScreenSaver', 'org.xfce.ScreenSaver',
                 'SimulateUserActivity', None, None, Gio.DBusCallFlags.NONE, 5000, None)
         if appliance:
-            # The idle screen lets DPMS blank the panel; wake it before Xv and vblank use.
-            subprocess.run(['xset', '-dpms'], check=False)
+            lease = AppliancePresentation.acquire()
         # Keep a partial instance available for cleanup if initialization fails.
         presenter = XvPresenter.__new__(XvPresenter)
         presenter.__init__()
@@ -241,6 +241,10 @@ def main():
         pacer.start()
         bus = pipeline.get_bus()
         while not stop.is_set():
+            if lease is not None and lease.revoked():
+                state['revoked'] = True
+                stop.set()
+                break
             message = bus.timed_pop_filtered(
                 Gst.SECOND // 5, Gst.MessageType.ERROR | Gst.MessageType.EOS)
             if message is not None:
@@ -268,6 +272,7 @@ def main():
             pacer.join(timeout=3)
             if pacer.is_alive():
                 fail('cleanup', 'presentation thread did not stop')
+                pacer.join()
         ready.clear()
         if pipeline is not None:
             pipeline.set_state(Gst.State.NULL)
@@ -280,6 +285,11 @@ def main():
                 presenter.close()
             except Exception as error:
                 fail('cleanup', error)
+            else:
+                if lease is not None:
+                    lease.close()
+        elif lease is not None:
+            lease.close()
         if inhibitors:
             try:
                 active, = session_bus.call_sync(
@@ -304,7 +314,7 @@ def main():
             signal.signal(sig, handler)
     drained = (eos and state['input_eof'] and state['feed_done'] and not pending and
                counts['fed'] == counts['decoded'] == presenter.visible_frames)
-    success = not errors and (state['signalled'] or drained)
+    success = not errors and (state['signalled'] or state['revoked'] or drained)
     print('receiver stopped ' + json.dumps(dict(counts, eos=eos, success=success)),
           file=sys.stderr, flush=True)
     return 0 if success else 1

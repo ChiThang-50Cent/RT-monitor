@@ -67,39 +67,56 @@ done
 if [ -z "$RELEASE_ID" ]; then
     rescue_shell "Missing appliance.release=<id> parameter in /proc/cmdline"
 fi
+case "$RELEASE_ID" in
+    *[!a-zA-Z0-9_-]*|"") rescue_shell "Invalid release ID" ;;
+esac
 
 RELEASE_DIR="/media/boot/appliance/$RELEASE_ID"
 if [ ! -d "$RELEASE_DIR" ]; then
     rescue_shell "Appliance release directory $RELEASE_DIR not found"
 fi
 
-SHA_FILE="$RELEASE_DIR/SHA256SUMS"
-SQUASHFS_FILE="$RELEASE_DIR/rootfs.squashfs"
+verify_hash() {
+    actual=$(sha256sum "$1" 2>/dev/null | awk '{print $1}')
+    [ "$actual" = "$2" ] || rescue_shell "Checksum mismatch: $1"
+}
 
-if [ ! -f "$SHA_FILE" ]; then
-    rescue_shell "SHA256SUMS file missing at $SHA_FILE"
-fi
-if [ ! -f "$SQUASHFS_FILE" ]; then
-    rescue_shell "rootfs.squashfs missing at $SQUASHFS_FILE"
-fi
-
-echo "Verifying SHA256 checksum for rootfs.squashfs..."
-EXPECTED_SHA=$(grep -E '(^|[[:space:]])rootfs\.squashfs$' "$SHA_FILE" | awk '{print $1}')
-if [ -z "$EXPECTED_SHA" ]; then
-    rescue_shell "No SHA256 entry for rootfs.squashfs found in $SHA_FILE"
-fi
-
-ACTUAL_SHA=$(sha256sum "$SQUASHFS_FILE" | awk '{print $1}')
-if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
-    rescue_shell "SHA256 checksum mismatch for rootfs.squashfs: expected $EXPECTED_SHA, got $ACTUAL_SHA"
-fi
-echo "Checksum verified: $ACTUAL_SHA"
-
-mkdir -p /ro_squash /overlay_tmpfs /sysroot
-
-echo "Loop-mounting rootfs.squashfs..."
-if ! mount -t squashfs -o ro,loop "$SQUASHFS_FILE" /ro_squash; then
-    rescue_shell "Failed to loop-mount $SQUASHFS_FILE"
+LOWERS="/ro_squash"
+if [ -f "$RELEASE_DIR/release.conf" ]; then
+    [ -f /extension-descriptor.sha256 ] || rescue_shell "Extension not authorized by initramfs"
+    verify_hash "$RELEASE_DIR/release.conf" "$(cat /extension-descriptor.sha256)"
+    FORMAT="" BASE_ID="" BASE_SHA="" EXT_SHA=""
+    while IFS='=' read -r key value; do
+        case "$key" in
+            format) [ -z "$FORMAT" ] || rescue_shell "Duplicate format"; FORMAT="$value" ;;
+            base_id) [ -z "$BASE_ID" ] || rescue_shell "Duplicate base_id"; BASE_ID="$value" ;;
+            base_sha256) [ -z "$BASE_SHA" ] || rescue_shell "Duplicate base hash"; BASE_SHA="$value" ;;
+            extension_sha256) [ -z "$EXT_SHA" ] || rescue_shell "Duplicate extension hash"; EXT_SHA="$value" ;;
+            *) rescue_shell "Unknown descriptor key" ;;
+        esac
+    done < "$RELEASE_DIR/release.conf"
+    [ "$FORMAT" = surface-extension-v1 ] || rescue_shell "Invalid extension format"
+    [ "$BASE_ID" = 6258b2a5368a ] || rescue_shell "Invalid frozen base"
+    [ "$BASE_SHA" = 48e1fb2c68aade6b2ae28faa14482ed332f67bcd27a2a3dc27449d3eae13516f ] || rescue_shell "Invalid frozen base hash"
+    [ "${#EXT_SHA}" = 64 ] || rescue_shell "Invalid extension hash length"
+    case "$EXT_SHA" in *[!0-9a-f]*) rescue_shell "Invalid extension hash" ;; esac
+    BASE_FILE="/media/boot/appliance/$BASE_ID/rootfs.squashfs"
+    verify_hash "$BASE_FILE" "$BASE_SHA"
+    verify_hash "$RELEASE_DIR/extension.squashfs" "$EXT_SHA"
+    mkdir -p /ro_base /ro_extension /overlay_tmpfs /sysroot
+    mount -t squashfs -o ro,loop "$BASE_FILE" /ro_base || rescue_shell "Base mount failed"
+    mount -t squashfs -o ro,loop "$RELEASE_DIR/extension.squashfs" /ro_extension || rescue_shell "Extension mount failed"
+    LOWERS="/ro_extension:/ro_base"
+else
+    [ ! -f /extension-descriptor.sha256 ] || rescue_shell "Missing authorized extension descriptor"
+    SHA_FILE="$RELEASE_DIR/SHA256SUMS"
+    SQUASHFS_FILE="$RELEASE_DIR/rootfs.squashfs"
+    EXPECTED_SHA=$(awk '$2 == "rootfs.squashfs" {print $1}' "$SHA_FILE")
+    [ "${#EXPECTED_SHA}" = 64 ] || rescue_shell "Invalid rootfs checksum entry"
+    case "$EXPECTED_SHA" in *[!0-9a-f]*) rescue_shell "Invalid rootfs hash" ;; esac
+    verify_hash "$SQUASHFS_FILE" "$EXPECTED_SHA"
+    mkdir -p /ro_squash /overlay_tmpfs /sysroot
+    mount -t squashfs -o ro,loop "$SQUASHFS_FILE" /ro_squash || rescue_shell "Rootfs mount failed"
 fi
 
 echo "Setting up tmpfs overlay..."
@@ -109,7 +126,7 @@ fi
 
 mkdir -p /overlay_tmpfs/upper /overlay_tmpfs/work
 
-if ! mount -t overlay overlay -o lowerdir=/ro_squash,upperdir=/overlay_tmpfs/upper,workdir=/overlay_tmpfs/work /sysroot; then
+if ! mount -t overlay overlay -o lowerdir="$LOWERS",upperdir=/overlay_tmpfs/upper,workdir=/overlay_tmpfs/work /sysroot; then
     rescue_shell "Failed to mount overlay on /sysroot"
 fi
 
@@ -117,6 +134,13 @@ mkdir -p /sysroot/media/boot
 if ! mount --move /media/boot /sysroot/media/boot; then
     rescue_shell "Failed to move /media/boot into /sysroot/media/boot"
 fi
+
+for lower in $(echo "$LOWERS" | tr ':' ' '); do
+    mkdir -p "/sysroot$lower"
+    mount --move "$lower" "/sysroot$lower" || rescue_shell "Failed to retain $lower"
+done
+mkdir -p /sysroot/overlay_tmpfs
+mount --move /overlay_tmpfs /sysroot/overlay_tmpfs || rescue_shell "Failed to retain RAM overlay"
 
 umount /dev
 umount /sys
