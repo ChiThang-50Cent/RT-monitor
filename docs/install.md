@@ -86,6 +86,7 @@ The PC needs this software. The tested PC runs Ubuntu 26.04.
 
 - GNOME on Wayland. The sender uses the Mutter ScreenCast `RecordVirtual` API.
 - PipeWire, GStreamer with `nvh264enc`, and system Python 3 with PyGObject.
+- A C compiler, `pkg-config`, and the PipeWire and SPA development headers to build the host cursor helper. On Ubuntu these are provided by `build-essential`, `pkg-config`, `libpipewire-0.3-dev`, and `libspa-0.2-dev`.
 - NetworkManager, Docker (your user in the `docker` group), `git`, `curl`, and `udisksctl`.
 - Read and write access to the APX USB device (`0955:7130`) without `sudo`. On the tested PC, the user is in the `plugdev` group.
 
@@ -130,11 +131,13 @@ The last command must exit without a prompt. The appliance OS later reuses this 
 
 ## 4. Start the display sender
 
-Copy the receiver to Nura and start the PC service:
+Build the host cursor helper. Then copy the complete receiver to Nura and start the PC service. Update both endpoints together.
 
 ```sh
+sh surface-gud/build-cursor-capture.sh
 scp -i ~/.ssh/surface_omp -o UserKnownHostsFile=surface-known-hosts \
 	surface-gud/display_receiver.py surface-gud/surface_xv.py surface-gud/surface_protocol.py surface-gud/surface_power.py \
+	surface-gud/surface_cursor.py \
 	user@10.42.0.2:/home/user/
 install -Dm644 surface-gud/surface-display.service ~/.config/systemd/user/surface-display.service
 systemctl --user daemon-reload

@@ -27,7 +27,7 @@ These numbers come from `lab/` runs on the appliance OS:
 | Capture to visible on the Surface, median and p95 | 80 ms and 99 ms |
 | Decoded frames identical to the stock decoder | 300 of 300 |
 
-The panel refreshes at 61.78 Hz, not 60 Hz. At 30 frames per second, about 6% of frames wait 3 vblanks instead of 2, so motion is not perfectly even. The PC mouse cursor is part of the video, so it moves at 30 frames per second and lags by the same 80 ms.
+The panel refreshes at 61.78 Hz, not 60 Hz. At 30 frames per second, about 6% of video frames wait 3 vblanks instead of 2, so video motion is not perfectly even. The current sender captures cursor metadata separately and sends it over a second pinned SSH connection. The Surface draws the cursor above keyed video without copying decoded pixels. Cursor movement no longer waits for video admission, decoding, or the presentation queue. Update both endpoints and build the host cursor helper before using this path.
 
 ## Limits
 

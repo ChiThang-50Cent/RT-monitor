@@ -8,6 +8,9 @@ gi.require_version('GstVideo', '1.0')
 gi.require_version('GstAllocators', '1.0')
 from gi.repository import Gst, GstVideo, GstAllocators
 
+from surface_protocol import WIDTH, HEIGHT
+from surface_cursor import CursorServer
+
 class WindowAttributes(C.Structure):
     _fields_ = [('background_pixmap', C.c_ulong), ('background_pixel', C.c_ulong),
                 ('border_pixmap', C.c_ulong), ('border_pixel', C.c_ulong),
@@ -63,6 +66,8 @@ class XvPresenter:
         self.port = None
         self.image = None
         self.previous = None
+        self.cursor_server = None
+        self.color_key = 0x080808
         self.x = C.CDLL('libX11.so.6')
         self.xv = C.CDLL('libXv.so.1')
         self.drm = C.CDLL('libdrm.so.2', use_errno=True)
@@ -94,6 +99,7 @@ class XvPresenter:
         bind(self.xv, 'XvCreateImage', [p, u, C.c_int, p, C.c_int, C.c_int], C.POINTER(XvImage))
         bind(self.xv, 'XvPutImage', [p, u, u, p, C.POINTER(XvImage), C.c_int, C.c_int, C.c_uint, C.c_uint, C.c_int, C.c_int, C.c_uint, C.c_uint])
         bind(self.xv, 'XvGetPortAttribute', [p, u, u, C.POINTER(C.c_int)])
+        bind(self.xv, 'XvSetPortAttribute', [p, u, u, C.c_int])
         bind(self.drm, 'drmOpen', [C.c_char_p, C.c_char_p])
         bind(self.drm, 'drmGetMagic', [C.c_int, C.POINTER(C.c_uint32)])
         bind(self.drm, 'drmPrimeFDToHandle', [C.c_int, C.c_int, C.POINTER(C.c_uint32)])
@@ -132,6 +138,24 @@ class XvPresenter:
         if self.xv.XvGrabPort(self.display, port, 0):
             raise RuntimeError('Could not grab first Xv adaptor port')
         self.port = port
+        color_atom = self.x.XInternAtom(self.display, b'XV_COLORKEY', 0)
+        if self.xv.XvSetPortAttribute(self.display, self.port, color_atom, self.color_key):
+            raise RuntimeError('Could not enable Xv colorkey')
+        self.window = self.x.XCreateSimpleWindow(
+            self.display, self.root, 0, 0, WIDTH, HEIGHT, 0, self.color_key, self.color_key)
+        if not self.window:
+            raise RuntimeError('XCreateSimpleWindow failed')
+        self.x.XStoreName(self.display, self.window, b'Surface PC Display')
+        attrs = WindowAttributes()
+        attrs.override_redirect = 1
+        self.x.XChangeWindowAttributes(self.display, self.window, 1 << 9, C.byref(attrs))
+        self.gc = self.x.XCreateGC(self.display, self.window, 0, None)
+        if not self.gc:
+            raise RuntimeError('XCreateGC failed')
+        self.x.XMapRaised(self.display, self.window)
+        self.x.XSync(self.display, 0)
+        self.cursor_server = CursorServer(self)
+        self.cursor_socket = self.cursor_server.name
 
     def present(self, sample):
         b = sample.get_buffer()
@@ -141,17 +165,10 @@ class XvPresenter:
         if not meta or meta.n_planes != 3:
             raise RuntimeError('Expected three-plane GstVideoMeta')
         geometry = (visible[0], visible[1], meta.width, meta.height)
+        if visible != (WIDTH, HEIGHT):
+            raise RuntimeError('expected native visible geometry 1366x768')
         if self.geometry is None:
             self.geometry = geometry
-            self.window = self.x.XCreateSimpleWindow(self.display, self.root, 0, 0, *visible, 0, 0, 0)
-            if not self.window:
-                raise RuntimeError('XCreateSimpleWindow failed')
-            self.x.XStoreName(self.display, self.window, b'Surface PC Display')
-            attrs = WindowAttributes()
-            attrs.override_redirect = 1
-            self.x.XChangeWindowAttributes(self.display, self.window, 1 << 9, C.byref(attrs))
-            self.gc = self.x.XCreateGC(self.display, self.window, 0, None)
-            self.x.XMapRaised(self.display, self.window)
             # Existing passthrough V1 FOURCC, deliberately synchronous commits.
             fourcc = ord('Y') | (ord('V') << 8) | (ord('2') << 16) | (ord('1') << 24)
             self.image = self.xv.XvCreateImage(self.display, self.port, fourcc, None, meta.width, meta.height)
@@ -207,6 +224,13 @@ class XvPresenter:
         return event.reply.sequence
 
     def close(self):
+        cursor_error = None
+        if self.cursor_server is not None:
+            try:
+                self.cursor_server.close()
+            except Exception as error:
+                cursor_error = error
+            self.cursor_server = None
         if self.display:
             if self.window and self.port is not None:
                 self.xv.XvStopVideo(self.display, self.port, self.window)
@@ -226,3 +250,5 @@ class XvPresenter:
         if self.gpu >= 0:
             os.close(self.gpu)
             self.gpu = -1
+        if cursor_error is not None:
+            raise cursor_error

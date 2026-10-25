@@ -23,7 +23,11 @@ encode video or copy decoded Surface pixels.
 - H.264 is lossy 4:2:0. Native geometry does **not** imply pixel-exact RGB:
   fine colored text can lose chroma detail. This replaces the lossless LZ4/
   copy-region implementation rather than retaining a fallback.
-- The PC cursor is embedded in capture. Surface touch/input is not forwarded.
+- The PC cursor uses Mutter metadata mode, not embedded video pixels. A host
+  native PipeWire subscriber captures its position, hotspot, visibility, and
+  bitmap before GStreamer starts. A separate pinned SSH connection sends the
+  latest complete cursor state without video admission credits. Surface
+  touch/input is not forwarded.
 - A latest-only raw capture sink discards stale frames **before** encoding.
   A monotonic host frame clock selects images at 30 fps and repeats the last
   owned capture while idle. It does not depend on PipeWire keepalive timestamps
@@ -60,6 +64,25 @@ encode video or copy decoded Surface pixels.
 - Host service `surface-display.service` remains enabled for the graphical
   session. No host root permissions or kernel module are needed.
 
+The cursor helper subscribes at a maximum 60 Hz while video admission remains
+30 fps. It does not map video pixels. Movement reuses the current bitmap and
+hotspot. A new cursor connection receives a complete shape before position-only
+updates. The private receiver socket belongs to the video presenter and closes
+before its window and presentation lease are released. Cursor-channel failure
+reconnects the receiver without recreating the Mutter monitor.
+
+The Tegra driver disables the hardware cursor during Xv playback. The presenter
+uses `XV_COLORKEY` to place the keyed X11 primary plane above the DMA-BUF video
+overlay. Cursor bitmaps are uploaded to small X11 pixmaps only when their shape
+changes. Movement clears the previous rectangle and copies the sprite at the
+new position. Alpha below 128 is transparent. Other pixels are opaque after
+RGB unpremultiplication, so translucent shadows are not reproduced. Cursor
+updates can lead delayed video hover and drag feedback. This path does not
+remove video latency or prove an input-to-photon bound.
+
+Build the host helper with a C compiler, `pkg-config`, and the PipeWire and SPA
+development headers. Its runtime path is `~/.local/libexec/surface-cursor-capture`.
+
 Requirements: GNOME/Mutter ScreenCast `RecordVirtual`, PipeWire, system Python
 with PyGObject/Gio/GStreamer, `pipewiresrc`, `videoconvert`,
 `appsrc`/`appsink`, and working NVIDIA `nvh264enc` on the PC. On the Surface:
@@ -79,10 +102,13 @@ The deployed setup uses `user@10.42.0.2`, X11 `:0`, UID 10000, SSH key
 `display_sender.py --help` exposes target/key/known-hosts overrides.
 
 ```sh
+sh surface-gud/build-cursor-capture.sh
+
 # Deploy receiver with the same pinned SSH options used for the connection.
 scp -i ~/.ssh/surface_omp -o UserKnownHostsFile=surface-known-hosts \
   -o StrictHostKeyChecking=yes surface-gud/display_receiver.py \
   surface-gud/surface_xv.py surface-gud/surface_protocol.py surface-gud/surface_power.py \
+  surface-gud/surface_cursor.py \
   user@10.42.0.2:/home/user/
 
 # Foreground mode (do not run alongside the service).

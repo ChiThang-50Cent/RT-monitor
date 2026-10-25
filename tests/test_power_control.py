@@ -594,6 +594,7 @@ class ReceiverCleanupBehavior(unittest.TestCase):
 
             class Presenter:
                 visible_frames = 0
+                cursor_socket = 'surface-cursor-test'
 
                 def __init__(self):
                     journal.append('presenter-created')

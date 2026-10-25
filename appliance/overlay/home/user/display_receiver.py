@@ -10,6 +10,12 @@ import sys
 import threading
 import time
 
+if __name__ == '__main__' and len(sys.argv) > 1:
+    if len(sys.argv) != 3 or sys.argv[1] != '--cursor-channel':
+        sys.exit('usage: display_receiver.py [--cursor-channel NAME]')
+    from surface_cursor import cursor_channel
+    sys.exit(cursor_channel(sys.argv[2]))
+
 import gi
 
 gi.require_version('Gst', '1.0')
@@ -232,7 +238,7 @@ def main():
         if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError('pipeline refused PLAYING')
         emit({'ready': True, 'width': WIDTH, 'height': HEIGHT,
-              'fps': FPS, 'codec': 'h264-cavlc'})
+              'fps': FPS, 'codec': 'h264-cavlc', 'cursor_socket': presenter.cursor_socket})
         state['progress'] = time.monotonic()
         batch_started = state['progress']
         feeder = threading.Thread(target=feed, name='framed-input')

@@ -131,7 +131,7 @@ The following procedure builds a full release for the RAM U-Boot path:
 	appliance/verify-boot.sh <id>
 	```
 
-`surface-gud/display_receiver.py`, `surface-gud/surface_xv.py`, `surface-gud/surface_protocol.py`, and `surface-gud/surface_power.py` have copies in `appliance/overlay/home/user/`. Update both copies before you build.
+`display_receiver.py`, `surface_xv.py`, `surface_protocol.py`, `surface_power.py`, and `surface_cursor.py` under `surface-gud/` have copies in `appliance/overlay/home/user/`. Update both copies before you build. Rebuild the PC helper with `sh surface-gud/build-cursor-capture.sh` after changing `surface_cursor_capture.c`. Update both endpoints together.
 
 Old releases stay on the boot partition. To delete one, run this on Nura:
 
@@ -157,6 +157,28 @@ These fields matter most:
 | `gap_ms.p50` | About 32.4, which is 2 vblanks of the 61.78 Hz panel |
 | `gap_ms.p95` | 37 to 48. About 6% of frames wait 3 vblanks. |
 | `source-age-upper-ms p50` | About 80 |
+
+Cursor movement uses a separate SSH connection and is not represented by the
+video frame-gap or source-age fields. A missing cursor channel fails the
+connection rather than silently reverting to an embedded cursor.
+
+To exercise the current cursor sources on the Surface without installing them,
+run this command from an active display session:
+
+```sh
+/usr/bin/python3 lab/run_cursor.py
+```
+
+Add `--hold 180` to keep the RAM-loaded sender running for a three-minute
+physical pointer check before recovery. The recovery timer includes this hold.
+
+The runner interrupts the display, loads receiver code in RAM through pinned
+SSH, injects pointer motion, and tests leave, reentry, and channel reconnection.
+It restores the committed sender through a temporary PC service override. Logs
+and recovery sources stay under `/tmp/surface-latency-results/<time>-cursor/`.
+The test checks software presentation and does not photograph the panel.
+The restored process runs the committed sender until the next service restart.
+It does not install the cursor receiver or change the boot release.
 
 ## Measure decoder and presentation performance
 

@@ -5,6 +5,7 @@ from collections import deque
 import json
 import os
 from pathlib import Path
+import re
 import select
 import signal
 import subprocess
@@ -20,7 +21,8 @@ import gi
 gi.require_version("Gio", "2.0")
 gi.require_version("Gst", "1.0")
 from gi.repository import Gio, GLib, Gst
-from surface_protocol import FRAME, MAX_AU, WIDTH, HEIGHT, FPS
+from surface_protocol import FRAME, MAX_AU, WIDTH, HEIGHT, FPS, encode_cursor
+from surface_cursor_capture import CursorCapture
 
 DEST = "org.gnome.Mutter.ScreenCast"
 ROOT = "/org/gnome/Mutter/ScreenCast"
@@ -33,13 +35,98 @@ def log(text):
     print(text, file=sys.stderr, flush=True)
 
 
+class CursorSender:
+    def __init__(self, connection, capture, name):
+        self.connection = connection
+        self.capture = capture
+        command = connection.command
+        self.command = (command[:-2] +
+                        ["-o", "ControlMaster=no", "-o", "ControlPath=none",
+                         command[-2], command[-1] + " --cursor-channel " + name])
+        self.process = None
+        self.thread = None
+
+    def start(self):
+        self.process = subprocess.Popen(self.command, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, bufsize=0)
+        os.set_blocking(self.process.stdin.fileno(), False)
+        self.thread = threading.Thread(target=self.run, name="cursor-send")
+        self.thread.start()
+
+    def run(self):
+        revision = -1
+        previous_shape = None
+        try:
+            while not self.connection.done.is_set() and not self.connection.stopping.is_set():
+                self.connection.check()
+                if self.process.poll() is not None:
+                    raise OSError("cursor SSH exited")
+                current, state = self.capture.snapshot(revision)
+                if current == revision:
+                    continue
+                header, pixels = encode_cursor(state, previous_shape)
+                deadline = time.monotonic() + TIMEOUT
+                for data in (header, pixels):
+                    view = memoryview(data)
+                    while view:
+                        self.connection.check()
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("cursor write timed out")
+                        if not select.select([], [self.process.stdin], [], min(remaining, 0.2))[1]:
+                            continue
+                        try:
+                            count = os.write(self.process.stdin.fileno(), view)
+                        except BlockingIOError:
+                            continue
+                        if count <= 0:
+                            raise OSError("cursor input closed")
+                        view = view[count:]
+                reply = bytearray()
+                while len(reply) < 3:
+                    self.connection.check()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("cursor ACK timed out")
+                    if not select.select([self.process.stdout], [], [], min(remaining, 0.2))[0]:
+                        continue
+                    chunk = os.read(self.process.stdout.fileno(), 4 - len(reply))
+                    if not chunk:
+                        raise OSError("cursor output closed")
+                    reply.extend(chunk)
+                    if len(reply) > 3 or not b"ok\n".startswith(reply):
+                        raise OSError("invalid cursor ACK")
+                if state.shape is not None:
+                    previous_shape = state.shape
+                revision = current
+        except Exception as error:
+            self.connection.fail(error)
+
+    def close(self):
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+            if self.thread is not None:
+                self.thread.join()
+            self.process.stdin.close()
+            self.process.stdout.close()
+
+
 class Connection:
     """Three admission credits cover raw input, NVENC, transport and visible ACK."""
 
-    def __init__(self, capture, command, stopping):
+    def __init__(self, capture, command, stopping, cursor_capture):
         self.capture = capture
         self.command = command
         self.stopping = stopping
+        self.cursor_capture = cursor_capture
+        self.cursor_sender = None
+        self.cursor_socket = None
         self.cv = threading.Condition()
         self.done = threading.Event()
         self.error = None
@@ -60,6 +147,7 @@ class Connection:
             self.cv.notify_all()
 
     def check(self):
+        self.cursor_capture.check()
         if self.error is not None:
             raise OSError(self.error)
         if self.stopping.is_set() or self.done.is_set():
@@ -101,6 +189,11 @@ class Connection:
                                     (("width", WIDTH), ("height", HEIGHT), ("fps", FPS),
                                      ("codec", "h264-cavlc"))):
                                 raise OSError("invalid receiver readiness")
+                            name = message.get("cursor_socket")
+                            if (not isinstance(name, str) or len(name) > 128 or
+                                    re.fullmatch(r"surface-cursor-[A-Za-z0-9_-]+", name) is None):
+                                raise OSError("invalid receiver cursor socket")
+                            self.cursor_socket = name
                             self.ready = True
                             batch_started = now
                         elif "ack" in message:
@@ -242,6 +335,8 @@ class Connection:
                 while not self.ready:
                     self.check()
                     self.cv.wait(0.2)
+            self.cursor_sender = CursorSender(self, self.cursor_capture, self.cursor_socket)
+            self.cursor_sender.start()
             self.encoder = Gst.parse_launch(
                 "appsrc name=raw format=time is-live=true block=true max-buffers=1 "
                 "max-bytes=0 max-time=0 "
@@ -298,6 +393,8 @@ class Connection:
             self.done.set()
             with self.cv:
                 self.cv.notify_all()
+            if self.cursor_sender is not None:
+                self.cursor_sender.close()
             # Release a blocked push before joining its producer.
             if self.encoder is not None:
                 self.encoder.set_state(Gst.State.NULL)
@@ -332,6 +429,7 @@ def main():
     worker = None
     subscriptions = []
     session = None
+    cursor_capture = None
 
     def call(path, interface, method, parameters=None, result=None):
         return bus.call_sync(DEST, path, interface, method, parameters,
@@ -376,7 +474,7 @@ def main():
     def relay():
         while not stopping.is_set():
             try:
-                Connection(pipeline, ssh, stopping).run()
+                Connection(pipeline, ssh, stopping, cursor_capture).run()
             except Exception as error:
                 if not stopping.is_set():
                     log(f"receiver disconnected: {error}")
@@ -388,7 +486,7 @@ def main():
         session, = call(ROOT, DEST, "CreateSession", GLib.Variant("(a{sv})", ({},)), "(o)").unpack()
         subscriptions.append(bus.signal_subscribe(DEST, DEST + ".Session", "Closed", session,
                                                   None, Gio.DBusSignalFlags.NONE, closed))
-        properties = {"cursor-mode": GLib.Variant("u", 1), "is-platform": GLib.Variant("b", True)}
+        properties = {"cursor-mode": GLib.Variant("u", 2), "is-platform": GLib.Variant("b", True)}
         stream, = call(session, DEST + ".Session", "RecordVirtual",
                        GLib.Variant("(a{sv})", (properties,)), "(o)").unpack()
         subscription = bus.signal_subscribe(DEST, DEST + ".Stream", "PipeWireStreamAdded", stream,
@@ -405,6 +503,20 @@ def main():
             return status
         if node is None:
             raise RuntimeError("Mutter did not provide a PipeWire node")
+        cursor_capture = CursorCapture(node)
+
+        def cursor_health():
+            nonlocal status
+            try:
+                cursor_capture.check()
+            except Exception as error:
+                log(f"cursor capture: {error}")
+                status = 1
+                stop()
+                return False
+            return True
+
+        GLib.timeout_add(200, cursor_health)
         pipeline = Gst.parse_launch(
             f"pipewiresrc path={node} use-bufferpool=false do-timestamp=true "
             f"! video/x-raw,width={WIDTH},height={HEIGHT} "
@@ -419,7 +531,7 @@ def main():
             raise RuntimeError("capture failed to enter PLAYING")
         worker = threading.Thread(target=relay, name="receiver-reconnect")
         worker.start()
-        log(f"virtual display: node={node}, {WIDTH}x{HEIGHT}, {FPS} fps cap, H264 CAVLC, embedded cursor")
+        log(f"virtual display: node={node}, {WIDTH}x{HEIGHT}, {FPS} fps cap, H264 CAVLC, captured cursor")
         loop.run()
     except Exception as error:
         log(f"display sender: {error}")
@@ -431,6 +543,8 @@ def main():
         if pipeline is not None:
             pipeline.set_state(Gst.State.NULL)
             pipeline.get_bus().remove_signal_watch()
+        if cursor_capture is not None:
+            cursor_capture.close()
         for subscription in subscriptions:
             bus.signal_unsubscribe(subscription)
         if session is not None:
