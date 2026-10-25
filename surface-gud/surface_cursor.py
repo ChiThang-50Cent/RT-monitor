@@ -268,7 +268,7 @@ class CursorServer:
                     self.renderer.apply(CursorState())
                 except Exception as error:
                     print(f'cursor hide: {error}', file=sys.stderr, flush=True)
-                    break
+                    self.stopped.set()
 
     def close(self):
         self.stopped.set()
