@@ -1,1 +1,1 @@
-ACTION=="add", SUBSYSTEM=="net", KERNEL=="eth*", RUN+="/sbin/ifup eth0"
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="eth*", RUN+="/sbin/ifdown --force eth0", RUN+="/sbin/ifup eth0"

@@ -31,6 +31,24 @@ The preserved base release and the APX recovery path still use RAM U-Boot:
 
 The PC service `surface-display.service` connects once the network is up.
 
+## Reconnect USB Ethernet
+
+If the USB Ethernet adapter disconnects while the appliance is running, the kernel removes the `eth0` network interface, but `ifupdown-ng` retains the configured state in `/run/ifstate`. Without clearing this stale state, reconnecting the adapter causes udev to run `ifup eth0`, which skips interface configuration because `/run/ifstate` already marks `eth0` configured.
+
+The udev rule in `appliance/overlay/etc/udev/rules.d/90-network.rules` resets stale state on device add by ordering `/sbin/ifdown --force eth0` before `/sbin/ifup eth0`:
+
+```udev
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="eth*", RUN+="/sbin/ifdown --force eth0", RUN+="/sbin/ifup eth0"
+```
+
+To exercise state reconciliation and simulated event dispatch against real `ifupdown-ng` in an isolated network namespace:
+
+```sh
+python3 tests/check_ethernet_hotplug.py
+```
+
+The check verifies that stale state is cleared, `10.42.0.2/24` and the default route `10.42.0.1` are restored, repeated add actions converge idempotently, and management routes remain intact. It simulates event dispatch with dummy netdevices and does not claim hardware PASS or replace physical USB reconnection testing on the Surface.
+
 ## Connect over built-in Wi-Fi
 
 Use an image built with the optional Wi-Fi service and [provision its boot identity configuration](install.md#provision-optional-wi-fi-debugging). The WPA-PSK helper does not retrieve saved host passwords. Missing credentials leave Wi-Fi disabled.
