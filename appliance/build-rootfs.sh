@@ -30,24 +30,14 @@ if [ ! -d "$MODULES_SRC" ]; then
     exit 1
 fi
 
-echo "Verifying cached .apk packages against packages.lock..."
-package_count=0
-while read -r name ver sha; do
-    [ -z "$name" ] && continue
-    apk_path="$CACHE_DIR/$name-$ver.apk"
-    if [ ! -f "$apk_path" ]; then
-        echo "ERROR: Missing cached package $apk_path" >&2
-        exit 1
-    fi
-    actual_sha=$(sha256sum "$apk_path" | awk '{print $1}')
-    if [ "$actual_sha" != "$sha" ]; then
-        echo "ERROR: Checksum mismatch for $name-$ver.apk: expected $sha, got $actual_sha" >&2
-        exit 1
-    fi
-    package_count=$((package_count + 1))
-done < "$LOCK_FILE"
-
-echo "Verified all $package_count packages against $LOCK_FILE."
+APK_LIST=$(python3 "$HERE/package_payload.py" paths)
+mapfile -t APK_PATHS <<< "$APK_LIST"
+[ "${#APK_PATHS[@]}" -gt 0 ] || exit 1
+LICENSE=$(python3 "$HERE/package_payload.py" license)
+APK_NAMES=()
+for path in "${APK_PATHS[@]}"; do
+    APK_NAMES+=("/cache/apks/${path##*/}")
+done
 
 echo "Building rootfs in container..."
 docker run --rm \
@@ -55,6 +45,7 @@ docker run --rm \
     -e HOST_GID="$(id -g)" \
     -v "$CACHE_DIR":/cache/apks:ro \
     -v "$OVERLAY_DIR":/overlay:ro \
+    -v "$LICENSE":/LICENCE.NXP:ro \
     -v "$OUT":/out \
     alpine:edge@sha256:020dfcbaaf4cc1078bf2d9c7ba31a8466e334061dcd2f248001d68f79e52c000 sh -e -c '
 apk add --no-cache alpine-keys qemu-arm proot squashfs-tools tar
@@ -64,13 +55,18 @@ cp -L /usr/share/apk/keys/armv7/* /keys/
 cp -L /keys/* /target/etc/apk/keys/
 
 echo "Installing APKs into target rootfs from cache..."
-apk --arch armv7 --root /target --initdb --no-scripts add /cache/apks/*.apk
+apk --arch armv7 --root /target --initdb --no-network --no-scripts add "$@"
 
 echo "Running busybox setup and package install triggers under proot+qemu-arm..."
 proot -q qemu-arm -r /target -0 /bin/busybox sh -c "
     /bin/busybox --install -s
     apk fix --scripts
 "
+
+cp /target/lib/firmware/mrvl/sd8797_uapsta.bin.zst /tmp/surface-firmware.zst
+rm -rf /target/lib/firmware/mrvl /target/lib/firmware/libertas
+mkdir -p /target/lib/firmware/mrvl
+cp /tmp/surface-firmware.zst /target/lib/firmware/mrvl/sd8797_uapsta.bin.zst
 
 echo "Installing kernel modules tree..."
 cp -a /out/kernel/modules/* /target/
@@ -79,6 +75,9 @@ chown -R 0:0 /target/lib/modules
 
 echo "Applying overlay..."
 tar -C /overlay --owner=0 --group=0 -cf - . | tar -C /target -xpf -
+mkdir -p /target/usr/share/licenses/surface-wifi
+cp /LICENCE.NXP /target/usr/share/licenses/surface-wifi/LICENCE.NXP
+chmod 644 /target/usr/share/licenses/surface-wifi/LICENCE.NXP
 
 test -u /target/usr/bin/doas
 
@@ -107,6 +106,6 @@ mksquashfs /target /out/rootfs.squashfs -comp gzip -pf "$PSEUDO_FILE" -noappend
 chown "$HOST_UID:$HOST_GID" /out/rootfs.squashfs
 chmod 644 /out/rootfs.squashfs
 echo "rootfs.squashfs created successfully: $(du -h /out/rootfs.squashfs | awk "{print \$1}")"
-'
+' sh "${APK_NAMES[@]}"
 
 echo "build-rootfs.sh complete: $OUT/rootfs.squashfs"

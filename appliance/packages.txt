@@ -24,3 +24,5 @@ xauth
 xf86-video-opentegra
 xorg-server
 xset
+linux-firmware-mrvl
+wpa_supplicant

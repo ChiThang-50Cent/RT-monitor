@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+
+description="Optional Surface Wi-Fi debugging"
+supervisor="supervise-daemon"
+command="/usr/sbin/surface-wifi"
+pidfile="/run/surface-wifi.pid"
+respawn_delay=5
+respawn_max=0
+retry="TERM/20/KILL/5"
+
+depend() {
+    need localmount
+    after udev
+}

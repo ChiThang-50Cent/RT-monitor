@@ -15,6 +15,14 @@ The new release contains a small read-only extension over the checked base image
 
 The build also requires retained local inputs that Git does not contain. Preserve `nura/coldboot/nv-efi-kernel-probe/manifest.json` and its complete `package/`, the frozen `~/surface-releases/6258b2a5368a/rootfs.squashfs`, and the matching `~/.cache/surface-appliance/out/kernel/` build output. The builder verifies the retained EFI package and base hashes. A fresh clone alone cannot reconstruct this device-specific release. Do not commit device backups or private recovery material.
 
+Both image paths include optional built-in Wi-Fi for LAN-local SSH. Credentials are not build inputs. Fetch the reviewed APK pins and firmware notice before building:
+
+```sh
+appliance/lock.sh
+```
+
+The cache is `~/.cache/surface-appliance/`. The extension installs signed APK additions in scratch against the frozen package database. Existing packages cannot upgrade. Both images retain only `mrvl/sd8797_uapsta.bin.zst` from the added firmware packages, with the matching [NXP redistribution notice](https://gitlab.com/kernel-firmware/linux-firmware/-/raw/20260916/LICENSES/LICENCE.NXP). No firmware blob belongs in Git.
+
 1. From the PC checkout, build the bundle:
 
 	```sh
@@ -254,7 +262,7 @@ For the original recovery path, the PC loads U-Boot into the Surface's RAM throu
 	```
 
 	> [!NOTE]
-	> `lock.sh` resolves `appliance/packages.txt` against today's Alpine edge and rewrites `packages.lock`. Edge moves, so you can get newer versions than the tested set. The committed `packages.lock` records the tested set. Use `git diff appliance/packages.lock` to see what changed.
+	> `lock.sh` fetches the committed versions, checks cached SHA-256 values, and verifies Alpine signatures. If `packages.txt` adds a package, it resolves that addition and its dependencies in scratch with every existing version constrained, then appends their actual downloaded hashes to the lock. It never refreshes existing pins. Review dependency changes before building. Old edge pins may disappear upstream, so preserve the verified cache.
 
 2. Build the kernel, the root filesystem, the initramfs, and the release bundle:
 
@@ -263,6 +271,53 @@ For the original recovery path, the PC loads U-Boot into the Surface's RAM throu
 	```
 
 	The last line names the release, for example `published /home/you/surface-releases/6258b2a5368a`. The rest of this guide calls that ID `<id>`. Later builds skip the kernel when its inputs have not changed. A rootfs-only rebuild takes about 10 seconds.
+
+For a rootfs-only rebuild with the retained kernel output, run:
+
+```sh
+appliance/build-rootfs.sh "$HOME/.cache/surface-appliance/out"
+```
+
+Before installation, check the actual ARM payload in each image:
+
+```sh
+python3 -m unittest discover -s tests -p 'test_wifi.py'
+python3 -m unittest discover -s tests -p 'test_internal_efi.py'
+python3 tests/check_wifi_image.py --rootfs "$HOME/.cache/surface-appliance/out/rootfs.squashfs"
+python3 tests/check_wifi_image.py --bundle "$BUNDLE" \
+	--base "$HOME/surface-releases/6258b2a5368a/rootfs.squashfs"
+```
+
+The checker uses Docker, proot, and QEMU to execute the real ARM supplicant, control client, and DHCP utility against the extracted image or merged base and extension. It checks transitive ELF dependencies, firmware bytes and decompression, the license, module presence, package inventory integrity, and absence of configured PSKs. Its size output does not replace the installer's free-space preflight or 15 MiB reserve. These checks do not prove SDIO initialization, association, DHCP, or SSH on the Surface.
+
+## Provision optional Wi-Fi debugging
+
+Use a WPA-PSK AP whose IPv4 subnet does not overlap `10.42.0.0/24`, including wider prefixes. Wi-Fi does not install a gateway or change DNS. The display sender continues to use USB Ethernet at `10.42.0.2`. A captive portal, enterprise authentication, or WPA3-only setup needs an operator-managed standard supplicant configuration and is not supported by the WPA-PSK helper.
+
+1. Create a configuration outside the checkout. The hidden prompt accepts an ASCII passphrase or a 64-digit hexadecimal PSK:
+
+	```sh
+	python3 appliance/provision-wifi.py --ssid 'YOUR_WIFI_SSID' \
+		--output "$HOME/.config/surface-appliance/wpa_supplicant.conf"
+	```
+
+	The helper derives the PSK without writing the passphrase or printing either secret. The resulting PSK is password-equivalent. Do not put it in Git, command arguments, a release directory, or a bug report.
+
+2. After separately authorizing installation and verifying the Surface boot partition by UUID `17C0-8631`, set `BOOT` to its mounted root. Do not use partition 2, a guessed device, or an unverified mount. Copy the configuration as an explicit owner action:
+
+	```sh
+	sudo install -d -m 0700 "$BOOT/appliance/identity"
+	sudo install -m 0600 "$HOME/.config/surface-appliance/wpa_supplicant.conf" \
+		"$BOOT/appliance/identity/wpa_supplicant.conf"
+	sync
+	```
+
+	The image builder and bundle installer do not perform this step. FAT does not enforce per-file modes or encrypt secrets. The initramfs mounts the boot volume root-only with `fmask=0177,dmask=0077`, and the service copies the config into root-only `/run/surface-wifi` with mode `0600`.
+
+3. Install the checked image through the applicable existing procedure, then follow [Connect over built-in Wi-Fi](operate.md#connect-over-built-in-wi-fi). Without a configuration, Wi-Fi stays disabled. An absent device, unavailable AP, or bad credentials cannot delay SSH or the display runlevel.
+
+Hardware Wi-Fi remains unverified until a separately authorized Surface boot proves firmware load, association, DHCP, pinned SSH without USB Ethernet, reconnect, and cold-boot recovery. Building an image does not establish any of those results.
+
 
 ## 8. Stage the release on Nura
 

@@ -51,7 +51,7 @@ fi
 
 echo "Mounting boot partition $BOOT_DEV at /media/boot (read-only)..."
 mkdir -p /media/boot
-if ! mount -t vfat -o ro,noatime,fmask=0077,dmask=0077 "$BOOT_DEV" /media/boot; then
+if ! mount -t vfat -o ro,noatime,uid=0,gid=0,fmask=0177,dmask=0077 "$BOOT_DEV" /media/boot; then
     rescue_shell "Failed to mount boot partition $BOOT_DEV read-only"
 fi
 

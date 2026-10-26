@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import package_payload
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('internal_efi_pc', HERE / 'install/internal-efi-pc.py')
@@ -39,8 +40,24 @@ def build(out):
     with tempfile.TemporaryDirectory(prefix='.internal-efi-', dir=out) as temporary:
         work = Path(temporary)
         overlay = work / 'overlay'
-        shutil.copytree(HERE / 'overlay', overlay, symlinks=True,
-                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        inventory = package_payload.stage_extension_packages(base, overlay)
+        for path in (HERE / 'overlay').rglob('*'):
+            relative = path.relative_to(HERE / 'overlay')
+            target = overlay / relative
+            if '__pycache__' in relative.parts or path.suffix == '.pyc':
+                continue
+            if path.is_dir() and not path.is_symlink():
+                if target.is_symlink() or (target.exists() and not target.is_dir()):
+                    raise ValueError('source overlay directory collision: ' + str(relative))
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                if target.exists() or target.is_symlink():
+                    raise ValueError('source overlay collides with package: ' + str(relative))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if path.is_symlink():
+                    target.symlink_to(os.readlink(path))
+                else:
+                    shutil.copy2(path, target)
         if (overlay / 'lib/modules').exists():
             raise ValueError('extension must not contain modules')
         for path in overlay.rglob('*'):
@@ -82,6 +99,8 @@ def build(out):
         shared = {name: package / name for name in original['output_sha256'] if name.startswith('EFI/')}
         shared['EFI/Microsoft/Boot/bootmgfw.efi'] = package / 'EFI/BOOT/BOOTARM.EFI'
         identity = {'format': 'surface-internal-efi-v1', 'base_id': efi.BASE_ID, 'base_sha256': efi.BASE_SHA, 'descriptor_sha256': efi.digest(descriptor), 'payload_sha256': {name: efi.digest(path) for name, path in payloads.items()}, 'shared_sha256': {name: efi.digest(path) for name, path in shared.items()}, 'source_manifest_sha256': efi.digest(proven / 'manifest.json'), 'packages_lock_sha256': efi.digest(HERE / 'packages.lock'), 'installer_sha256': efi.digest(HERE / 'install/internal-efi-pc.py'), 'builder_sha256': efi.digest(Path(__file__)), 'init_source_sha256': efi.digest(HERE / 'initramfs/init'), 'compression': 'gzip'}
+        identity['package_payload_sha256'] = efi.digest(HERE / 'package_payload.py')
+        identity['package_inventory_sha256'] = efi.digest(inventory)
         rid = hashlib.sha256(efi.canonical(identity)).hexdigest()[:24]
         namespace = f'appliance/{rid}'
         files = []
@@ -110,6 +129,7 @@ def build(out):
         copy(package / 'initramfs', artifact / 'recovery/proven-initramfs')
         copy(proven / 'manifest.json', artifact / 'recovery/source-manifest.json')
         copy(HERE / 'install/internal-efi-pc.py', artifact / 'internal-efi-pc.py')
+        copy(inventory, artifact / 'package-inventory.json')
         manifest = {'schema': 1, 'release_id': rid, 'identity': identity, 'boot_uuid': efi.UUID, 'filesystem': 'vfat', 'source_manifest_sha256': identity['source_manifest_sha256'], 'cmdline': cmdline, 'required_base': {'id': efi.BASE_ID, 'path': f'appliance/{efi.BASE_ID}/rootfs.squashfs', 'sha256': efi.BASE_SHA, 'size': base.stat().st_size}, 'files': sorted(files, key=lambda e: (e['order'], e['target']))}
         (artifact / 'manifest.json').write_bytes(efi.canonical(manifest) + b'\n')
         efi.load_bundle(artifact)
@@ -118,6 +138,8 @@ def build(out):
             if (final / 'manifest.json').read_bytes() != (artifact / 'manifest.json').read_bytes():
                 raise ValueError('existing release ID has different content')
             efi.load_bundle(final)
+            if efi.digest(final / 'package-inventory.json') != identity['package_inventory_sha256']:
+                raise ValueError('existing package inventory checksum mismatch')
         else:
             for path in artifact.rglob('*'):
                 if path.is_file():

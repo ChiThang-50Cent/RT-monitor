@@ -31,6 +31,46 @@ The preserved base release and the APX recovery path still use RAM U-Boot:
 
 The PC service `surface-display.service` connects once the network is up.
 
+## Connect over built-in Wi-Fi
+
+Use an image built with the optional Wi-Fi service and [provision its boot identity configuration](install.md#provision-optional-wi-fi-debugging). The WPA-PSK helper does not retrieve saved host passwords. Missing credentials leave Wi-Fi disabled.
+
+1. Find the DHCP lease for `surface-rt` in the AP or router lease table. If the hostname is absent, identify the device by its WLAN MAC address through a root console. Do not assume a fixed address or trust an SSH key discovered by scanning.
+2. Set `WIFI_IP` to that lease and connect with the existing Surface key pin:
+
+	```sh
+	ssh -i "$HOME/.ssh/surface_omp" \
+		-o UserKnownHostsFile="$PWD/surface-known-hosts" \
+		-o StrictHostKeyChecking=yes -o HostKeyAlias=10.42.0.2 \
+		user@"$WIFI_IP"
+	```
+
+	`HostKeyAlias` reuses the already pinned Ethernet identity. Do not run `ssh-keyscan`, disable host checks, or add an unchecked DHCP-address key.
+
+3. Inspect the addresses and connected routes:
+
+	```sh
+	ip -4 addr show dev mlan0
+	ip -4 route
+	```
+
+	The offered AP subnet must not overlap `10.42.0.0/24`. Change the AP subnet before use if it overlaps. The service delegates DHCP to the stock Alpine hook with `NO_GATEWAY` and `NO_DNS` for `mlan0`. Wi-Fi must not add a default route or change `/etc/resolv.conf`. Leave the display sender pointed at `10.42.0.2`.
+
+The `surface-wifi` OpenRC service starts independently of Ethernet, SSH, and Xorg. One background worker owns foreground supplicant and DHCP children. It waits for `mlan0`, retries failed sessions after five seconds, and lets the supplicant reconnect after AP loss. It does not configure Wi-Fi through `ifup` or the global `networking` service.
+
+For status, credential reload, or private diagnostics, use an existing authorized root console. The ordinary appliance user has no added service-management or log-reading privilege:
+
+```sh
+rc-service surface-wifi status
+rc-service surface-wifi restart
+rc-service surface-wifi stop
+```
+
+Restart reloads the boot configuration. Stop terminates and reaps both clients, removes runtime credentials, and clears only `mlan0`. A missing or invalid source file disables Wi-Fi until restart. Parser and DHCP output stays in root-only `/run/surface-wifi/diagnostics.log` and can contain sensitive information. Do not publish that log or dump the configuration. Kernel diagnostics may require the root console too.
+
+Local image checks do not prove physical Wi-Fi. Before relying on it, record successful firmware initialization, `mlan0` enumeration, WPA association, a non-overlapping DHCP lease, and strict-key SSH with USB Ethernet absent. Then check AP loss and recovery, bad credentials without blocked boot, repeated service restart and stop without leftover clients, and a cold boot. Reconnect Ethernet and confirm the existing display stream still works. Until those checks run on the Surface, hardware Wi-Fi remains unverified.
+
+
 ## Read the idle screen
 
 When no PC is connected, the appliance shows **Surface RT display** and one status line:

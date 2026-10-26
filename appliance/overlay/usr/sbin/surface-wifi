@@ -1,0 +1,88 @@
+#!/usr/bin/python3
+import fcntl
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import threading
+
+RUNTIME = Path('/run/surface-wifi')
+SOURCE = Path('/media/boot/appliance/identity/wpa_supplicant.conf')
+DEVICE = Path('/sys/class/net/mlan0')
+
+
+def copy_config(source, runtime):
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 65536:
+            raise ValueError('invalid Wi-Fi configuration file')
+        with os.fdopen(fd, 'rb', closefd=False) as stream:
+            data = stream.read(65537)
+        if len(data) > 65536:
+            raise ValueError('Wi-Fi configuration too large')
+        temporary = runtime / 'config.tmp'
+        with open(temporary, 'wb') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(data)
+        temporary.replace(runtime / 'wpa_supplicant.conf')
+    finally:
+        os.close(fd)
+
+
+def stop_children(children):
+    for child in reversed(children):
+        if child.poll() is None:
+            child.terminate()
+    for child in reversed(children):
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+
+
+def run():
+    os.umask(0o077)
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    RUNTIME.chmod(0o700)
+    stopping = threading.Event()
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, lambda *_: stopping.set())
+    with open(RUNTIME / 'lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            try:
+                copy_config(SOURCE, RUNTIME)
+            except (OSError, ValueError):
+                print('surface-wifi: no usable configuration; Wi-Fi disabled', flush=True)
+                stopping.wait()
+                return
+            while not stopping.is_set():
+                if not DEVICE.exists():
+                    stopping.wait(2)
+                    continue
+                children = []
+                with open(RUNTIME / 'diagnostics.log', 'wb') as log:
+                    try:
+                        subprocess.run(['ip', 'link', 'set', 'dev', 'mlan0', 'up'], stdout=log, stderr=log, check=True)
+                        children.append(subprocess.Popen(['/sbin/wpa_supplicant', '-D', 'nl80211', '-i', 'mlan0', '-c', str(RUNTIME / 'wpa_supplicant.conf')], stdout=log, stderr=log))
+                        children.append(subprocess.Popen(['/sbin/udhcpc', '-f', '-R', '-i', 'mlan0', '-x', 'hostname:surface-rt', '-s', '/usr/share/udhcpc/default.script'], stdout=log, stderr=log))
+                        while not stopping.wait(2):
+                            if not DEVICE.exists() or any(child.poll() is not None for child in children):
+                                break
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                    finally:
+                        stop_children(children)
+                        subprocess.run(['ip', '-4', 'addr', 'flush', 'dev', 'mlan0'], stdout=log, stderr=log)
+                        subprocess.run(['ip', 'link', 'set', 'dev', 'mlan0', 'down'], stdout=log, stderr=log)
+                stopping.wait(5)
+        finally:
+            (RUNTIME / 'wpa_supplicant.conf').unlink(missing_ok=True)
+            (RUNTIME / 'config.tmp').unlink(missing_ok=True)
+
+
+if __name__ == '__main__':
+    run()
